@@ -1,0 +1,34 @@
+
+# Python environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets and environment settings
+.env
+.env.*
+!.env.example
+
+# Exclude user-uploaded content
+/uploads/claims/
+/uploads/found/
+/uploads/lost/
+/uploads/messages/
+
+# Ignore other uploads by default
+/uploads/*
+!/uploads/logo.png
+!/uploads/rtu.jpg
+!/uploads/rtulogo.png
+
+# Temporary files
+*.log
+.DS_Store
+
+/config/database.php
+
+# AI environment and downloaded models
+ai/venv/
+ai/__pycache__/
+ai/models/

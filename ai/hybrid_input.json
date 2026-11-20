@@ -1,0 +1,22 @@
+{
+    "source": {
+        "id": 1,
+        "image": "uploads/lost/lost_6aa8c818a0639.jpg",
+        "item_name": "Black cellphone",
+        "category": "Electronics",
+        "description": "Black smartphone with a cracked screen",
+        "color": "Black",
+        "location": "RTU Boni Campus"
+    },
+    "candidates": [
+        {
+            "id": 2,
+            "image": "uploads/found/found_d835e03a0d37.jpg",
+            "item_name": "Black smartphone",
+            "category": "Electronics",
+            "description": "Found black phone with a damaged screen",
+            "color": "Black",
+            "location": "RTU Boni Campus"
+        }
+    ]
+}
