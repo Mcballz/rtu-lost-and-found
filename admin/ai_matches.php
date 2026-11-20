@@ -1,21 +1,68 @@
 
 <?php
+
 session_start();
+
+/* =========================================================
+   PREVENT BROWSER CACHING
+========================================================= */
 
 header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
 header("Cache-Control: post-check=0, pre-check=0", false);
 header("Pragma: no-cache");
 header("Expires: 0");
 
-require_once "../config/database.php";
 
-if (!isset($_SESSION["user_id"]) || ($_SESSION["role"] ?? "") !== "admin") {
+/* =========================================================
+   CHECK ADMIN LOGIN
+========================================================= */
+
+if (!isset($_SESSION["user_id"])) {
     header("Location: ../login.php");
     exit();
 }
 
-/* Get AI matches */
-$sql = "SELECT
+
+/* =========================================================
+   SUPABASE CONNECTION
+========================================================= */
+
+require_once __DIR__ . "/../config/supabase.php";
+
+
+/* =========================================================
+   VERIFY ADMIN ROLE
+========================================================= */
+
+$user_id = (int) $_SESSION["user_id"];
+
+try {
+
+    $stmt = $supabase->prepare("
+        SELECT id, role
+        FROM users
+        WHERE id = :user_id
+        LIMIT 1
+    ");
+
+    $stmt->execute([
+        ":user_id" => $user_id
+    ]);
+
+    $current_user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$current_user || $current_user["role"] !== "admin") {
+        header("Location: ../dashboard.php");
+        exit();
+    }
+
+
+    /* =====================================================
+       GET AI MATCHES
+    ===================================================== */
+
+    $sql = "
+        SELECT
             am.id,
             am.similarity_score,
             am.created_at,
@@ -30,27 +77,47 @@ $sql = "SELECT
 
         FROM ai_matches am
 
-        JOIN items li
+        INNER JOIN items li
             ON am.lost_item_id = li.id
 
-        JOIN items fi
+        INNER JOIN items fi
             ON am.found_item_id = fi.id
 
-        ORDER BY am.similarity_score DESC";
+        ORDER BY am.similarity_score DESC
+    ";
 
-$result = $conn->query($sql);
+    $stmt = $supabase->query($sql);
+
+    $matches = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+} catch (PDOException $e) {
+
+    error_log("Admin AI Matches Error: " . $e->getMessage());
+
+    $database_error = true;
+    $matches = [];
+
+}
+
 ?>
 
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 
 <title>AI Possible Matches - RTU Lost and Found</title>
 
 <style>
+
 /* GLOBAL */
+
 * {
     box-sizing: border-box;
     margin: 0;
@@ -70,6 +137,7 @@ a {
 }
 
 /* BLUE MAIN NAVBAR */
+
 .navbar {
     width: 100%;
     min-height: 70px;
@@ -116,9 +184,7 @@ a {
     flex-shrink: 0;
 }
 
-/* =========================================================
-   ADMIN NAVIGATION
-========================================================= */
+/* ADMIN NAVIGATION */
 
 .admin-nav {
     width: 100%;
@@ -157,6 +223,7 @@ a {
 }
 
 /* MAIN CONTAINER */
+
 .container {
     width: 92%;
     max-width: 1200px;
@@ -164,6 +231,7 @@ a {
 }
 
 /* PAGE HEADER */
+
 .page-header {
     background: #ffffff;
     border: 1px solid #e8edf2;
@@ -188,6 +256,7 @@ a {
 }
 
 /* SECTION HEADING */
+
 .section-heading {
     display: flex;
     align-items: center;
@@ -207,6 +276,7 @@ a {
 }
 
 /* AI NOTICE */
+
 .notice {
     display: flex;
     align-items: flex-start;
@@ -235,6 +305,7 @@ a {
 }
 
 /* MATCH CARD */
+
 .match-card {
     background: #ffffff;
     border: 1px solid #e5eaf0;
@@ -273,6 +344,7 @@ a {
 }
 
 /* SIMILARITY SCORE */
+
 .score-box {
     min-width: 145px;
     padding: 12px 17px;
@@ -301,6 +373,7 @@ a {
 }
 
 /* MATCH CLASSIFICATION */
+
 .match-level {
     display: inline-block;
     margin-top: 9px;
@@ -329,6 +402,7 @@ a {
 }
 
 /* MATCH INFORMATION */
+
 .match-info {
     background: #f8fafc;
     border: 1px solid #e7edf4;
@@ -367,6 +441,7 @@ a {
 }
 
 /* ITEM COMPARISON */
+
 .comparison-heading {
     color: #173b6d;
     font-size: 15px;
@@ -421,19 +496,23 @@ a {
     overflow-wrap: anywhere;
 }
 
-/* ITEM IMAGES */
+/* FULL-SIZE ITEM IMAGES */
+
 .item-image,
 .no-image {
     width: 100%;
     max-width: 320px;
-    height: 225px;
+    min-height: 180px;
+    max-height: 450px;
     margin: 0 auto 13px;
     border-radius: 9px;
 }
 
 .item-image {
     display: block;
+    height: auto;
     object-fit: contain;
+    object-position: center;
     background: #ffffff;
     border: 1px solid #e0e6ed;
     padding: 7px;
@@ -456,6 +535,7 @@ a {
 }
 
 /* VIEW BUTTON */
+
 .view-button {
     display: inline-flex;
     justify-content: center;
@@ -477,6 +557,7 @@ a {
 }
 
 /* EMPTY STATE */
+
 .empty {
     background: #ffffff;
     border: 1px solid #e5eaf0;
@@ -497,7 +578,20 @@ a {
     font-size: 13px;
 }
 
+/* DATABASE ERROR */
+
+.database-error {
+    background: #fee2e2;
+    border: 1px solid #fecaca;
+    border-radius: 10px;
+    padding: 15px 18px;
+    margin-bottom: 20px;
+    color: #991b1b;
+    font-size: 13px;
+}
+
 /* FOOTER */
+
 .page-footer {
     text-align: center;
     color: #8a96a5;
@@ -506,7 +600,9 @@ a {
 }
 
 /* RESPONSIVE */
+
 @media (max-width: 850px) {
+
     .navbar {
         padding: 8px 4%;
     }
@@ -527,9 +623,11 @@ a {
     .match-info-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
+
 }
 
 @media (max-width: 600px) {
+
     .navbar {
         min-height: 65px;
         padding: 8px 4%;
@@ -604,15 +702,18 @@ a {
 
     .item-image,
     .no-image {
-        height: 205px;
+        max-width: 100%;
     }
+
 }
+
 </style>
 </head>
 
 <body>
 
 <!-- BLUE MAIN NAVBAR -->
+
 <header class="navbar">
 
     <a href="dashboard.php" class="brand">
@@ -632,7 +733,8 @@ a {
 
 </header>
 
-<!-- WHITE ADMIN NAVIGATION -->
+<!-- ADMIN NAVIGATION -->
+
 <nav class="admin-nav">
 
     <a href="items.php">Manage Items</a>
@@ -646,6 +748,7 @@ a {
 </nav>
 
 <!-- MAIN CONTENT -->
+
 <main class="container">
 
     <section class="page-header">
@@ -658,6 +761,14 @@ a {
         </p>
 
     </section>
+
+    <?php if (!empty($database_error)): ?>
+
+        <div class="database-error">
+            Unable to load AI matches. Please check your database connection and try again.
+        </div>
+
+    <?php endif; ?>
 
     <section class="notice">
 
@@ -677,12 +788,13 @@ a {
         Generated Match Results
     </h2>
 
-    <?php if ($result && $result->num_rows > 0): ?>
+    <?php if (!empty($matches)): ?>
 
-        <?php while ($match = $result->fetch_assoc()): ?>
+        <?php foreach ($matches as $match): ?>
 
             <?php
-            $score = floatval($match["similarity_score"]);
+
+            $score = (float) $match["similarity_score"];
 
             if ($score >= 80) {
                 $level = "Very High Similarity";
@@ -694,6 +806,7 @@ a {
                 $level = "Possible Match";
                 $level_class = "possible";
             }
+
             ?>
 
             <article class="match-card">
@@ -710,13 +823,15 @@ a {
                             Generated:
                             <?php
                             echo htmlspecialchars(
-                                $match["created_at"] ?? ""
+                                (string) ($match["created_at"] ?? ""),
+                                ENT_QUOTES,
+                                "UTF-8"
                             );
                             ?>
                         </span>
 
                         <span class="match-level <?php echo $level_class; ?>">
-                            <?php echo htmlspecialchars($level); ?>
+                            <?php echo htmlspecialchars($level, ENT_QUOTES, "UTF-8"); ?>
                         </span>
 
                     </div>
@@ -736,6 +851,7 @@ a {
                 </div>
 
                 <!-- MATCH INFORMATION -->
+
                 <div class="match-info">
 
                     <h3>Match Information</h3>
@@ -743,32 +859,45 @@ a {
                     <div class="match-info-grid">
 
                         <div class="info-item">
+
                             <span>Lost Item</span>
+
                             <strong>
                                 <?php
                                 echo htmlspecialchars(
-                                    $match["lost_item_name"] ?? ""
+                                    (string) ($match["lost_item_name"] ?? ""),
+                                    ENT_QUOTES,
+                                    "UTF-8"
                                 );
                                 ?>
                             </strong>
+
                         </div>
 
                         <div class="info-item">
+
                             <span>Found Item</span>
+
                             <strong>
                                 <?php
                                 echo htmlspecialchars(
-                                    $match["found_item_name"] ?? ""
+                                    (string) ($match["found_item_name"] ?? ""),
+                                    ENT_QUOTES,
+                                    "UTF-8"
                                 );
                                 ?>
                             </strong>
+
                         </div>
 
                         <div class="info-item">
+
                             <span>Match Record</span>
+
                             <strong>
                                 #<?php echo (int) $match["id"]; ?>
                             </strong>
+
                         </div>
 
                     </div>
@@ -776,6 +905,7 @@ a {
                 </div>
 
                 <!-- ITEM COMPARISON -->
+
                 <h3 class="comparison-heading">
                     Item Comparison
                 </h3>
@@ -783,6 +913,7 @@ a {
                 <div class="comparison">
 
                     <!-- LOST ITEM -->
+
                     <section class="item-panel lost-panel">
 
                         <span class="item-type-label">
@@ -794,7 +925,9 @@ a {
                         <p class="item-name">
                             <?php
                             echo htmlspecialchars(
-                                $match["lost_item_name"] ?? ""
+                                (string) ($match["lost_item_name"] ?? ""),
+                                ENT_QUOTES,
+                                "UTF-8"
                             );
                             ?>
                         </p>
@@ -804,7 +937,7 @@ a {
                             <img
                                 src="../uploads/lost/<?php
                                     echo rawurlencode(
-                                        basename($match["lost_image"])
+                                        basename((string) $match["lost_image"])
                                     );
                                 ?>"
                                 alt="Lost Item"
@@ -835,6 +968,7 @@ a {
                     </section>
 
                     <!-- FOUND ITEM -->
+
                     <section class="item-panel found-panel">
 
                         <span class="item-type-label">
@@ -846,7 +980,9 @@ a {
                         <p class="item-name">
                             <?php
                             echo htmlspecialchars(
-                                $match["found_item_name"] ?? ""
+                                (string) ($match["found_item_name"] ?? ""),
+                                ENT_QUOTES,
+                                "UTF-8"
                             );
                             ?>
                         </p>
@@ -856,7 +992,7 @@ a {
                             <img
                                 src="../uploads/found/<?php
                                     echo rawurlencode(
-                                        basename($match["found_image"])
+                                        basename((string) $match["found_image"])
                                     );
                                 ?>"
                                 alt="Found Item"
@@ -890,7 +1026,7 @@ a {
 
             </article>
 
-        <?php endwhile; ?>
+        <?php endforeach; ?>
 
     <?php else: ?>
 
@@ -913,7 +1049,9 @@ a {
 </main>
 
 <script>
-/* BACK-FORWARD CACHE PROTECTION */
+
+/* PREVENT BACK/FORWARD CACHE */
+
 window.addEventListener("pageshow", function (event) {
 
     if (event.persisted) {
@@ -921,6 +1059,19 @@ window.addEventListener("pageshow", function (event) {
     }
 
 });
+
+/* =========================================================
+   REQUIRE AI MATCH ACCESS CODE
+========================================================= */
+
+if (
+    !isset($_SESSION["ai_matches_verified_user"]) ||
+    (int) $_SESSION["ai_matches_verified_user"] !== $user_id
+) {
+    header("Location: ai_matches_access.php");
+    exit();
+}
+
 </script>
 
 </body>

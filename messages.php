@@ -20,30 +20,117 @@ if (!isset($_SESSION["user_id"])) {
     exit();
 }
 
-require_once "config/database.php";
+/* Use the working Supabase PDO connection */
+require_once __DIR__ . "/config/supabase.php";
 
 $current_user_id = (int)$_SESSION["user_id"];
+
+if (!isset($supabase) || !($supabase instanceof PDO)) {
+    error_log("RTU Messages Error: Supabase PDO connection is unavailable.");
+    die("Database connection is unavailable. Please check config/supabase.php.");
+}
+
+/* =========================================================
+   LIVE SEEN STATUS CHECK
+========================================================= */
+
+if (isset($_GET["ajax"]) && $_GET["ajax"] === "seen_status") {
+
+    header("Content-Type: application/json; charset=UTF-8");
+
+    $other_user_id = (int)($_GET["user"] ?? 0);
+    $item_id = (int)($_GET["item"] ?? 0);
+
+    if (
+        $other_user_id <= 0 ||
+        $item_id <= 0 ||
+        $other_user_id === $current_user_id
+    ) {
+        echo json_encode(["seen_ids" => []]);
+        exit();
+    }
+
+    try {
+
+        /* Mark incoming messages as read */
+
+        $mark_read = $supabase->prepare("
+            UPDATE messages
+            SET is_read = TRUE
+            WHERE sender_id = :sender_id
+            AND receiver_id = :receiver_id
+            AND item_id = :item_id
+            AND is_read = FALSE
+        ");
+
+        $mark_read->execute([
+            ":sender_id" => $other_user_id,
+            ":receiver_id" => $current_user_id,
+            ":item_id" => $item_id
+        ]);
+
+        /* Get the current user's messages that the recipient has read */
+
+        $seen_stmt = $supabase->prepare("
+            SELECT id
+            FROM messages
+            WHERE sender_id = :sender_id
+            AND receiver_id = :receiver_id
+            AND item_id = :item_id
+            AND is_read = TRUE
+        ");
+
+        $seen_stmt->execute([
+            ":sender_id" => $current_user_id,
+            ":receiver_id" => $other_user_id,
+            ":item_id" => $item_id
+        ]);
+
+        $seen_ids = array_map(
+            "intval",
+            $seen_stmt->fetchAll(PDO::FETCH_COLUMN)
+        );
+
+        echo json_encode([
+            "seen_ids" => $seen_ids
+        ]);
+
+    } catch (Throwable $e) {
+
+        error_log("RTU Seen Status Error: " . $e->getMessage());
+
+        echo json_encode([
+            "seen_ids" => []
+        ]);
+    }
+
+    exit();
+}
 
 /* =========================================================
    CURRENT USER
 ========================================================= */
 
-$user_stmt = $conn->prepare("
-    SELECT id, name, student_id, email, role
-    FROM users
-    WHERE id = ?
-    LIMIT 1
-");
+try {
 
-if (!$user_stmt) {
-    die("Unable to load user information: " . htmlspecialchars($conn->error));
+    $user_stmt = $supabase->prepare("
+        SELECT id, name, student_id, email, role
+        FROM users
+        WHERE id = :user_id
+        LIMIT 1
+    ");
+
+    $user_stmt->execute([
+        ":user_id" => $current_user_id
+    ]);
+
+    $current_user = $user_stmt->fetch(PDO::FETCH_ASSOC);
+
+} catch (PDOException $e) {
+
+    error_log("RTU Current User Error: " . $e->getMessage());
+    die("Unable to load user information. Please check the database connection.");
 }
-
-$user_stmt->bind_param("i", $current_user_id);
-$user_stmt->execute();
-
-$current_user = $user_stmt->get_result()->fetch_assoc();
-$user_stmt->close();
 
 if (!$current_user) {
     session_destroy();
@@ -67,7 +154,9 @@ $allowed_image_types = [
 ];
 
 if (!is_dir($message_upload_directory)) {
-    mkdir($message_upload_directory, 0755, true);
+    if (!mkdir($message_upload_directory, 0755, true) && !is_dir($message_upload_directory)) {
+        error_log("RTU Messages Error: Unable to create uploads/messages directory.");
+    }
 }
 
 /* =========================================================
@@ -95,22 +184,18 @@ if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["send_message"])) {
 
         /* Verify recipient */
 
-        $check_receiver = $conn->prepare("
+        $check_receiver = $supabase->prepare("
             SELECT id
             FROM users
-            WHERE id = ?
+            WHERE id = :receiver_id
             LIMIT 1
         ");
 
-        if (!$check_receiver) {
-            throw new Exception("Recipient query failed: " . $conn->error);
-        }
+        $check_receiver->execute([
+            ":receiver_id" => $receiver_id
+        ]);
 
-        $check_receiver->bind_param("i", $receiver_id);
-        $check_receiver->execute();
-
-        $receiver_exists = $check_receiver->get_result()->num_rows > 0;
-        $check_receiver->close();
+        $receiver_exists = $check_receiver->fetch(PDO::FETCH_ASSOC);
 
         if (!$receiver_exists) {
             throw new Exception("Recipient account does not exist.");
@@ -118,22 +203,18 @@ if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["send_message"])) {
 
         /* Verify item */
 
-        $check_item = $conn->prepare("
+        $check_item = $supabase->prepare("
             SELECT id
             FROM items
-            WHERE id = ?
+            WHERE id = :item_id
             LIMIT 1
         ");
 
-        if (!$check_item) {
-            throw new Exception("Item query failed: " . $conn->error);
-        }
+        $check_item->execute([
+            ":item_id" => $item_id
+        ]);
 
-        $check_item->bind_param("i", $item_id);
-        $check_item->execute();
-
-        $item_exists = $check_item->get_result()->num_rows > 0;
-        $check_item->close();
+        $item_exists = $check_item->fetch(PDO::FETCH_ASSOC);
 
         if (!$item_exists) {
             throw new Exception("The selected item does not exist.");
@@ -199,7 +280,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["send_message"])) {
 
         /* Insert message */
 
-        $send_stmt = $conn->prepare("
+        $send_stmt = $supabase->prepare("
             INSERT INTO messages
             (
                 sender_id,
@@ -209,27 +290,24 @@ if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["send_message"])) {
                 image_path,
                 is_read
             )
-            VALUES (?, ?, ?, ?, ?, 0)
+            VALUES
+            (
+                :sender_id,
+                :receiver_id,
+                :item_id,
+                :message,
+                :image_path,
+                FALSE
+            )
         ");
 
-        if (!$send_stmt) {
-            throw new Exception("Message query preparation failed: " . $conn->error);
-        }
-
-        $send_stmt->bind_param(
-            "iiiss",
-            $current_user_id,
-            $receiver_id,
-            $item_id,
-            $message,
-            $image_path
-        );
-
-        if (!$send_stmt->execute()) {
-            throw new Exception("Message insert failed: " . $send_stmt->error);
-        }
-
-        $send_stmt->close();
+        $send_stmt->execute([
+            ":sender_id" => $current_user_id,
+            ":receiver_id" => $receiver_id,
+            ":item_id" => $item_id,
+            ":message" => $message,
+            ":image_path" => $image_path
+        ]);
 
         $_SESSION["message_send_status"] = "success";
 
@@ -272,20 +350,20 @@ if (
 
     if ($message_id > 0 && in_array($reaction, $allowed_reactions, true)) {
 
-        $message_check = $conn->prepare("
-            SELECT id, sender_id, receiver_id
-            FROM messages
-            WHERE id = ?
-            LIMIT 1
-        ");
+        try {
 
-        if ($message_check) {
+            $message_check = $supabase->prepare("
+                SELECT id, sender_id, receiver_id
+                FROM messages
+                WHERE id = :message_id
+                LIMIT 1
+            ");
 
-            $message_check->bind_param("i", $message_id);
-            $message_check->execute();
+            $message_check->execute([
+                ":message_id" => $message_id
+            ]);
 
-            $message_data = $message_check->get_result()->fetch_assoc();
-            $message_check->close();
+            $message_data = $message_check->fetch(PDO::FETCH_ASSOC);
 
             if (
                 $message_data &&
@@ -295,87 +373,72 @@ if (
                 )
             ) {
 
-                $existing_stmt = $conn->prepare("
+                $existing_stmt = $supabase->prepare("
                     SELECT id, reaction
                     FROM message_reactions
-                    WHERE message_id = ?
-                    AND user_id = ?
+                    WHERE message_id = :message_id
+                    AND user_id = :user_id
                     LIMIT 1
                 ");
 
-                if ($existing_stmt) {
+                $existing_stmt->execute([
+                    ":message_id" => $message_id,
+                    ":user_id" => $current_user_id
+                ]);
 
-                    $existing_stmt->bind_param(
-                        "ii",
-                        $message_id,
-                        $current_user_id
-                    );
+                $existing = $existing_stmt->fetch(PDO::FETCH_ASSOC);
 
-                    $existing_stmt->execute();
-                    $existing = $existing_stmt->get_result()->fetch_assoc();
-                    $existing_stmt->close();
+                if ($existing) {
 
-                    if ($existing) {
+                    if ($existing["reaction"] === $reaction) {
 
-                        if ($existing["reaction"] === $reaction) {
+                        $reaction_stmt = $supabase->prepare("
+                            DELETE FROM message_reactions
+                            WHERE message_id = :message_id
+                            AND user_id = :user_id
+                        ");
 
-                            $reaction_stmt = $conn->prepare("
-                                DELETE FROM message_reactions
-                                WHERE message_id = ?
-                                AND user_id = ?
-                            ");
-
-                            if ($reaction_stmt) {
-                                $reaction_stmt->bind_param(
-                                    "ii",
-                                    $message_id,
-                                    $current_user_id
-                                );
-                            }
-
-                        } else {
-
-                            $reaction_stmt = $conn->prepare("
-                                UPDATE message_reactions
-                                SET reaction = ?
-                                WHERE message_id = ?
-                                AND user_id = ?
-                            ");
-
-                            if ($reaction_stmt) {
-                                $reaction_stmt->bind_param(
-                                    "sii",
-                                    $reaction,
-                                    $message_id,
-                                    $current_user_id
-                                );
-                            }
-                        }
+                        $reaction_stmt->execute([
+                            ":message_id" => $message_id,
+                            ":user_id" => $current_user_id
+                        ]);
 
                     } else {
 
-                        $reaction_stmt = $conn->prepare("
-                            INSERT INTO message_reactions
-                            (message_id, user_id, reaction)
-                            VALUES (?, ?, ?)
+                        $reaction_stmt = $supabase->prepare("
+                            UPDATE message_reactions
+                            SET reaction = :reaction
+                            WHERE message_id = :message_id
+                            AND user_id = :user_id
                         ");
 
-                        if ($reaction_stmt) {
-                            $reaction_stmt->bind_param(
-                                "iis",
-                                $message_id,
-                                $current_user_id,
-                                $reaction
-                            );
-                        }
+                        $reaction_stmt->execute([
+                            ":reaction" => $reaction,
+                            ":message_id" => $message_id,
+                            ":user_id" => $current_user_id
+                        ]);
                     }
 
-                    if (isset($reaction_stmt) && $reaction_stmt) {
-                        $reaction_stmt->execute();
-                        $reaction_stmt->close();
-                    }
+                } else {
+
+                    $reaction_stmt = $supabase->prepare("
+                        INSERT INTO message_reactions
+                        (message_id, user_id, reaction)
+                        VALUES
+                        (:message_id, :user_id, :reaction)
+                    ");
+
+                    $reaction_stmt->execute([
+                        ":message_id" => $message_id,
+                        ":user_id" => $current_user_id,
+                        ":reaction" => $reaction
+                    ]);
                 }
             }
+
+        } catch (Throwable $e) {
+
+            error_log("RTU Message Reaction Error: " . $e->getMessage());
         }
     }
 
@@ -399,84 +462,89 @@ $selected_item = (int)($_GET["item"] ?? 0);
 
 $conversations = [];
 
-$conversations_stmt = $conn->prepare("
-    SELECT
-        m.item_id,
+try {
 
-        CASE
-            WHEN m.sender_id = ?
-            THEN m.receiver_id
-            ELSE m.sender_id
-        END AS other_user_id,
+    /*
+       DISTINCT ON retrieves the latest message for each
+       user-and-item conversation in PostgreSQL.
+    */
 
-        u.name AS other_user_name,
-        i.item_name,
-        i.item_type,
+    $conversations_stmt = $supabase->prepare("
+        SELECT *
+        FROM (
+            SELECT DISTINCT ON (
+                m.item_id,
+                CASE
+                    WHEN m.sender_id = :current_user_1
+                    THEN m.receiver_id
+                    ELSE m.sender_id
+                END
+            )
+                m.item_id,
 
-        CASE
-            WHEN m.image_path IS NOT NULL
-            AND m.image_path != ''
-            AND (m.message IS NULL OR m.message = '')
-            THEN 'Photo'
-            ELSE m.message
-        END AS latest_message,
+                CASE
+                    WHEN m.sender_id = :current_user_2
+                    THEN m.receiver_id
+                    ELSE m.sender_id
+                END AS other_user_id,
 
-        m.created_at AS latest_time
+                u.name AS other_user_name,
+                i.item_name,
+                i.item_type,
 
-    FROM messages m
+                CASE
+                    WHEN m.image_path IS NOT NULL
+                    AND m.image_path <> ''
+                    AND (m.message IS NULL OR m.message = '')
+                    THEN 'Photo'
+                    ELSE m.message
+                END AS latest_message,
 
-    INNER JOIN users u
-        ON u.id = CASE
-            WHEN m.sender_id = ?
-            THEN m.receiver_id
-            ELSE m.sender_id
-        END
+                m.created_at AS latest_time
 
-    INNER JOIN items i
-        ON i.id = m.item_id
+            FROM messages m
 
-    WHERE m.id IN (
-        SELECT MAX(m2.id)
-        FROM messages m2
-        WHERE m2.sender_id = ?
-        OR m2.receiver_id = ?
-        GROUP BY
-            m2.item_id,
-            CASE
-                WHEN m2.sender_id = ?
-                THEN m2.receiver_id
-                ELSE m2.sender_id
-            END
-    )
+            INNER JOIN users u
+                ON u.id = CASE
+                    WHEN m.sender_id = :current_user_3
+                    THEN m.receiver_id
+                    ELSE m.sender_id
+                END
 
-    ORDER BY m.created_at DESC
-");
+            INNER JOIN items i
+                ON i.id = m.item_id
 
-if ($conversations_stmt) {
+            WHERE
+                m.sender_id = :current_user_4
+                OR m.receiver_id = :current_user_5
 
-    $conversations_stmt->bind_param(
-        "iiiii",
-        $current_user_id,
-        $current_user_id,
-        $current_user_id,
-        $current_user_id,
-        $current_user_id
-    );
+            ORDER BY
+                m.item_id,
+                CASE
+                    WHEN m.sender_id = :current_user_6
+                    THEN m.receiver_id
+                    ELSE m.sender_id
+                END,
+                m.created_at DESC,
+                m.id DESC
+        ) AS latest_conversations
+        ORDER BY latest_time DESC
+    ");
 
-    if ($conversations_stmt->execute()) {
+    $conversations_stmt->execute([
+        ":current_user_1" => $current_user_id,
+        ":current_user_2" => $current_user_id,
+        ":current_user_3" => $current_user_id,
+        ":current_user_4" => $current_user_id,
+        ":current_user_5" => $current_user_id,
+        ":current_user_6" => $current_user_id
+    ]);
 
-        $conversations = $conversations_stmt
-            ->get_result()
-            ->fetch_all(MYSQLI_ASSOC);
+    $conversations = $conversations_stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    } else {
-        error_log("RTU Conversations Error: " . $conversations_stmt->error);
-    }
+} catch (Throwable $e) {
 
-    $conversations_stmt->close();
-
-} else {
-    error_log("RTU Conversations Prepare Error: " . $conn->error);
+    error_log("RTU Conversations Error: " . $e->getMessage());
 }
 
 /* =========================================================
@@ -488,33 +556,32 @@ foreach ($conversations as &$conversation) {
     $other_user_id = (int)$conversation["other_user_id"];
     $conversation_item_id = (int)$conversation["item_id"];
 
-    $unread_stmt = $conn->prepare("
-        SELECT COUNT(*) AS unread_count
-        FROM messages
-        WHERE sender_id = ?
-        AND receiver_id = ?
-        AND item_id = ?
-        AND is_read = 0
-    ");
-
     $conversation["unread_count"] = 0;
 
-    if ($unread_stmt) {
+    try {
 
-        $unread_stmt->bind_param(
-            "iii",
-            $other_user_id,
-            $current_user_id,
-            $conversation_item_id
-        );
+        $unread_stmt = $supabase->prepare("
+            SELECT COUNT(*) AS unread_count
+            FROM messages
+            WHERE sender_id = :sender_id
+            AND receiver_id = :receiver_id
+            AND item_id = :item_id
+            AND is_read = FALSE
+        ");
 
-        $unread_stmt->execute();
+        $unread_stmt->execute([
+            ":sender_id" => $other_user_id,
+            ":receiver_id" => $current_user_id,
+            ":item_id" => $conversation_item_id
+        ]);
 
-        $unread_data = $unread_stmt->get_result()->fetch_assoc();
+        $unread_data = $unread_stmt->fetch(PDO::FETCH_ASSOC);
 
-        $conversation["unread_count"] = (int)$unread_data["unread_count"];
+        $conversation["unread_count"] = (int)($unread_data["unread_count"] ?? 0);
 
-        $unread_stmt->close();
+    } catch (Throwable $e) {
+
+        error_log("RTU Conversation Unread Error: " . $e->getMessage());
     }
 }
 
@@ -529,42 +596,44 @@ $selected_item_data = null;
 
 if ($selected_user > 0 && $selected_item > 0) {
 
-    $person_stmt = $conn->prepare("
-        SELECT id, name, student_id
-        FROM users
-        WHERE id = ?
-        LIMIT 1
-    ");
+    try {
 
-    if ($person_stmt) {
-        $person_stmt->bind_param("i", $selected_user);
-        $person_stmt->execute();
-        $selected_person = $person_stmt->get_result()->fetch_assoc();
-        $person_stmt->close();
-    } else {
-        error_log("RTU Selected Person Error: " . $conn->error);
+        $person_stmt = $supabase->prepare("
+            SELECT id, name, student_id
+            FROM users
+            WHERE id = :user_id
+            LIMIT 1
+        ");
+
+        $person_stmt->execute([
+            ":user_id" => $selected_user
+        ]);
+
+        $selected_person = $person_stmt->fetch(PDO::FETCH_ASSOC);
+
+    } catch (Throwable $e) {
+
+        error_log("RTU Selected Person Error: " . $e->getMessage());
     }
 
-    /*
-       Only select the columns needed by the chat.
-       This avoids the chat failing because of an unnecessary
-       or differently named image column.
-    */
+    try {
 
-    $item_stmt = $conn->prepare("
-        SELECT id, item_name, item_type
-        FROM items
-        WHERE id = ?
-        LIMIT 1
-    ");
+        $item_stmt = $supabase->prepare("
+            SELECT id, item_name, item_type
+            FROM items
+            WHERE id = :item_id
+            LIMIT 1
+        ");
 
-    if ($item_stmt) {
-        $item_stmt->bind_param("i", $selected_item);
-        $item_stmt->execute();
-        $selected_item_data = $item_stmt->get_result()->fetch_assoc();
-        $item_stmt->close();
-    } else {
-        error_log("RTU Selected Item Error: " . $conn->error);
+        $item_stmt->execute([
+            ":item_id" => $selected_item
+        ]);
+
+        $selected_item_data = $item_stmt->fetch(PDO::FETCH_ASSOC);
+
+    } catch (Throwable $e) {
+
+        error_log("RTU Selected Item Error: " . $e->getMessage());
     }
 }
 
@@ -577,91 +646,66 @@ $messages_error = "";
 
 if ($selected_user > 0 && $selected_item > 0) {
 
-    /*
-       Load messages using the two user IDs and the item ID.
-       This query works for both the sender and receiver.
-    */
+    try {
 
-    $messages_stmt = $conn->prepare("
-        SELECT
-            id,
-            sender_id,
-            receiver_id,
-            message,
-            image_path,
-            is_read,
-            created_at
-        FROM messages
-        WHERE item_id = ?
-        AND (
-            (sender_id = ? AND receiver_id = ?)
-            OR
-            (sender_id = ? AND receiver_id = ?)
-        )
-        ORDER BY id ASC
-    ");
+        $messages_stmt = $supabase->prepare("
+            SELECT
+                id,
+                sender_id,
+                receiver_id,
+                message,
+                image_path,
+                is_read,
+                created_at
+            FROM messages
+            WHERE item_id = :item_id
+            AND (
+                (sender_id = :current_user_1 AND receiver_id = :selected_user_1)
+                OR
+                (sender_id = :selected_user_2 AND receiver_id = :current_user_2)
+            )
+            ORDER BY id ASC
+        ");
 
-    if ($messages_stmt) {
+        $messages_stmt->execute([
+            ":item_id" => $selected_item,
+            ":current_user_1" => $current_user_id,
+            ":selected_user_1" => $selected_user,
+            ":selected_user_2" => $selected_user,
+            ":current_user_2" => $current_user_id
+        ]);
 
-        $messages_stmt->bind_param(
-            "iiiii",
-            $selected_item,
-            $current_user_id,
-            $selected_user,
-            $selected_user,
-            $current_user_id
-        );
+        $chat_messages = $messages_stmt->fetchAll(PDO::FETCH_ASSOC);
 
-        if ($messages_stmt->execute()) {
+    } catch (Throwable $e) {
 
-            $messages_result = $messages_stmt->get_result();
+        $messages_error = $e->getMessage();
 
-            while ($row = $messages_result->fetch_assoc()) {
-                $chat_messages[] = $row;
-            }
-
-        } else {
-
-            $messages_error = $messages_stmt->error;
-
-            error_log(
-                "RTU Chat Load Error: " . $messages_error
-            );
-        }
-
-        $messages_stmt->close();
-
-    } else {
-
-        $messages_error = $conn->error;
-
-        error_log(
-            "RTU Chat Prepare Error: " . $messages_error
-        );
+        error_log("RTU Chat Load Error: " . $messages_error);
     }
 
     /* Mark incoming messages as read */
 
-    $read_stmt = $conn->prepare("
-        UPDATE messages
-        SET is_read = 1
-        WHERE sender_id = ?
-        AND receiver_id = ?
-        AND item_id = ?
-        AND is_read = 0
-    ");
+    try {
 
-    if ($read_stmt) {
+        $read_stmt = $supabase->prepare("
+            UPDATE messages
+            SET is_read = TRUE
+            WHERE sender_id = :sender_id
+            AND receiver_id = :receiver_id
+            AND item_id = :item_id
+            AND is_read = FALSE
+        ");
 
-        $read_stmt->bind_param(
-            "iii",
-            $selected_user,
-            $current_user_id,
-            $selected_item
-        );
+        $read_stmt->execute([
+            ":sender_id" => $selected_user,
+            ":receiver_id" => $current_user_id,
+            ":item_id" => $selected_item
+        ]);
 
-        $read_stmt->execute();
-        $read_stmt->close();
+    } catch (Throwable $e) {
+
+        error_log("RTU Mark Messages Read Error: " . $e->getMessage());
     }
 }
 
@@ -671,22 +715,25 @@ if ($selected_user > 0 && $selected_item > 0) {
 
 $total_unread = 0;
 
-$unread_stmt = $conn->prepare("
-    SELECT COUNT(*) AS total_unread
-    FROM messages
-    WHERE receiver_id = ?
-    AND is_read = 0
-");
+try {
 
-if ($unread_stmt) {
+    $unread_stmt = $supabase->prepare("
+        SELECT COUNT(*) AS total_unread
+        FROM messages
+        WHERE receiver_id = :user_id
+        AND is_read = FALSE
+    ");
 
-    $unread_stmt->bind_param("i", $current_user_id);
-    $unread_stmt->execute();
+    $unread_stmt->execute([
+        ":user_id" => $current_user_id
+    ]);
 
-    $unread_result = $unread_stmt->get_result()->fetch_assoc();
-    $total_unread = (int)$unread_result["total_unread"];
+    $unread_result = $unread_stmt->fetch(PDO::FETCH_ASSOC);
+    $total_unread = (int)($unread_result["total_unread"] ?? 0);
 
-    $unread_stmt->close();
+} catch (Throwable $e) {
+
+    error_log("RTU Total Unread Error: " . $e->getMessage());
 }
 
 /* =========================================================
@@ -695,26 +742,44 @@ if ($unread_stmt) {
 
 $notification_unread = 0;
 
-$notification_stmt = $conn->prepare("
-    SELECT COUNT(*) AS total
-    FROM notifications
-    WHERE user_id = ?
-    AND is_read = 0
-    AND type = 'ai_match'
-");
+try {
 
-if ($notification_stmt) {
+    $notification_stmt = $supabase->prepare("
+        SELECT COUNT(*) AS total
+        FROM notifications
+        WHERE user_id = :user_id
+        AND is_read = TRUE
+        AND type = 'ai_match'
+    ");
 
-    $notification_stmt->bind_param("i", $current_user_id);
-    $notification_stmt->execute();
+    /*
+       Notifications use unread records, so is_read must be FALSE.
+    */
 
-    $notification_result = $notification_stmt->get_result();
+    $notification_stmt = $supabase->prepare("
+        SELECT COUNT(*) AS total
+        FROM notifications
+        WHERE user_id = :user_id
+        AND is_read = FALSE
+        AND type = 'ai_match'
+    ");
 
-    if ($notification_result) {
-        $notification_unread = (int)$notification_result->fetch_assoc()["total"];
-    }
+    $notification_stmt->execute([
+        ":user_id" => $current_user_id
+    ]);
 
-    $notification_stmt->close();
+    $notification_result = $notification_stmt->fetch(PDO::FETCH_ASSOC);
+
+    $notification_unread = (int)($notification_result["total"] ?? 0);
+
+} catch (Throwable $e) {
+
+    /*
+       The notifications table may not exist in every database setup.
+       Keep the messages page working if that table is unavailable.
+    */
+
+    error_log("RTU Notification Count Error: " . $e->getMessage());
 }
 
 /* =========================================================
@@ -725,7 +790,6 @@ $name_for_initial = trim($current_user["name"]);
 $profile_initial = strtoupper(substr($name_for_initial, 0, 1));
 
 ?>
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -736,18 +800,9 @@ $profile_initial = strtoupper(substr($name_for_initial, 0, 1));
 <title>Messages - RTU Lost and Found</title>
 
 <style>
+* { box-sizing: border-box; }
 
-/* =========================================================
-   GLOBAL
-========================================================= */
-
-* {
-    box-sizing: border-box;
-}
-
-html {
-    scroll-behavior: auto;
-}
+html { scroll-behavior: auto; }
 
 body {
     margin: 0;
@@ -755,10 +810,6 @@ body {
     background: #f1f5f9;
     color: #172033;
 }
-
-/* =========================================================
-   NAVBAR - PRESERVED
-========================================================= */
 
 .navbar {
     width: 100%;
@@ -784,9 +835,7 @@ body {
     flex-shrink: 0;
 }
 
-.brand:hover {
-    color: white;
-}
+.brand:hover { color: white; }
 
 .brand-title {
     font-size: 21px;
@@ -801,9 +850,7 @@ body {
     display: block;
 }
 
-.profile-container {
-    position: relative;
-}
+.profile-container { position: relative; }
 
 .profile-button {
     display: flex;
@@ -819,9 +866,7 @@ body {
     transition: background 0.2s;
 }
 
-.profile-button:hover {
-    background: rgba(255, 255, 255, 0.12);
-}
+.profile-button:hover { background: rgba(255,255,255,0.12); }
 
 .profile-name {
     font-size: 14px;
@@ -843,7 +888,7 @@ body {
     justify-content: center;
     font-size: 16px;
     font-weight: bold;
-    border: 2px solid rgba(255, 255, 255, 0.8);
+    border: 2px solid rgba(255,255,255,0.8);
 }
 
 .profile-arrow {
@@ -855,9 +900,7 @@ body {
     transition: transform 0.2s;
 }
 
-.profile-button.open .profile-arrow {
-    transform: rotate(180deg);
-}
+.profile-button.open .profile-arrow { transform: rotate(180deg); }
 
 .profile-dropdown {
     position: absolute;
@@ -866,7 +909,7 @@ body {
     width: 310px;
     background: white;
     border-radius: 16px;
-    box-shadow: 0 10px 35px rgba(0, 0, 0, 0.20);
+    box-shadow: 0 10px 35px rgba(0,0,0,0.20);
     border: 1px solid #e2e8f0;
     overflow: hidden;
     opacity: 0;
@@ -905,9 +948,7 @@ body {
     border: 3px solid #d4af37;
 }
 
-.profile-details {
-    min-width: 0;
-}
+.profile-details { min-width: 0; }
 
 .profile-details strong {
     display: block;
@@ -928,9 +969,7 @@ body {
     text-overflow: ellipsis;
 }
 
-.dropdown-links {
-    padding: 8px;
-}
+.dropdown-links { padding: 8px; }
 
 .dropdown-link {
     display: flex;
@@ -979,18 +1018,8 @@ body {
     font-weight: bold;
 }
 
-.signout {
-    color: #b91c1c !important;
-}
-
-.signout:hover {
-    background: #fef2f2 !important;
-    color: #991b1b !important;
-}
-
-/* =========================================================
-   PAGE
-========================================================= */
+.signout { color: #b91c1c !important; }
+.signout:hover { background: #fef2f2 !important; color: #991b1b !important; }
 
 .page {
     width: 100%;
@@ -999,9 +1028,7 @@ body {
     padding: 0 20px;
 }
 
-.page-title {
-    margin-bottom: 20px;
-}
+.page-title { margin-bottom: 20px; }
 
 .page-title h1 {
     margin: 0 0 6px;
@@ -1015,33 +1042,15 @@ body {
     font-size: 14px;
 }
 
-/* =========================================================
-   STATUS NOTICE
-========================================================= */
-
-.status-notice {
-    padding: 13px 16px;
-    margin-bottom: 16px;
-    border-radius: 9px;
-    font-size: 14px;
-    font-weight: 600;
+.seen-indicator {
+    margin-top: 4px;
+    color: #0b3d91;
+    font-size: 11px;
+    font-weight: 700;
+    text-align: right;
 }
 
-.status-notice.success {
-    background: #ecfdf5;
-    color: #166534;
-    border: 1px solid #bbf7d0;
-}
-
-.status-notice.error {
-    background: #fef2f2;
-    color: #991b1b;
-    border: 1px solid #fecaca;
-}
-
-/* =========================================================
-   MAIN MESSAGING BOX
-========================================================= */
+.seen-indicator[hidden] { display: none; }
 
 .messaging-container {
     width: 100%;
@@ -1054,10 +1063,6 @@ body {
     border: 1px solid #dbe3ef;
     box-shadow: 0 6px 24px rgba(15,23,42,0.10);
 }
-
-/* =========================================================
-   CONVERSATIONS
-========================================================= */
 
 .conversations {
     min-width: 0;
@@ -1148,10 +1153,6 @@ body {
     font-weight: 700;
 }
 
-/* =========================================================
-   CHAT
-========================================================= */
-
 .chat {
     min-width: 0;
     min-height: 0;
@@ -1194,17 +1195,8 @@ body {
     font-weight: 800;
 }
 
-.chat-person h3 {
-    margin: 0;
-    color: #172033;
-    font-size: 16px;
-}
-
-.chat-person p {
-    margin: 3px 0 0;
-    color: #64748b;
-    font-size: 12px;
-}
+.chat-person h3 { margin: 0; color: #172033; font-size: 16px; }
+.chat-person p { margin: 3px 0 0; color: #64748b; font-size: 12px; }
 
 .item-link {
     display: inline-block;
@@ -1218,14 +1210,7 @@ body {
     border-radius: 8px;
 }
 
-.item-link:hover {
-    background: #0b3d91;
-    color: white;
-}
-
-/* =========================================================
-   MESSAGE AREA
-========================================================= */
+.item-link:hover { background: #0b3d91; color: white; }
 
 .messages-area {
     flex: 1;
@@ -1243,13 +1228,8 @@ body {
     position: relative;
 }
 
-.message-row.mine {
-    justify-content: flex-end;
-}
-
-.message-row.theirs {
-    justify-content: flex-start;
-}
+.message-row.mine { justify-content: flex-end; }
+.message-row.theirs { justify-content: flex-start; }
 
 .message-content {
     position: relative;
@@ -1281,10 +1261,6 @@ body {
     box-shadow: 0 1px 4px rgba(15,23,42,0.05);
 }
 
-/* =========================================================
-   MESSAGE IMAGES
-========================================================= */
-
 .message-image {
     display: block;
     max-width: 100%;
@@ -1296,21 +1272,9 @@ body {
     margin-top: 5px;
 }
 
-.message-image:first-child {
-    margin-top: 0;
-}
-
-.mine .message-image {
-    border: 1px solid rgba(255,255,255,0.25);
-}
-
-.theirs .message-image {
-    border: 1px solid #e2e8f0;
-}
-
-/* =========================================================
-   IMAGE PREVIEW
-========================================================= */
+.message-image:first-child { margin-top: 0; }
+.mine .message-image { border: 1px solid rgba(255,255,255,0.25); }
+.theirs .message-image { border: 1px solid #e2e8f0; }
 
 .image-preview-container {
     display: none;
@@ -1321,9 +1285,7 @@ body {
     border-top: 1px solid #e2e8f0;
 }
 
-.image-preview-container.show {
-    display: flex;
-}
+.image-preview-container.show { display: flex; }
 
 .image-preview {
     width: 65px;
@@ -1352,31 +1314,11 @@ body {
     cursor: pointer;
 }
 
-.remove-image-button:hover {
-    background: #ffe4e6;
-}
+.remove-image-button:hover { background: #ffe4e6; }
 
-/* =========================================================
-   MESSAGE TIME
-========================================================= */
-
-.message-time {
-    margin-top: 4px;
-    color: #94a3b8;
-    font-size: 10px;
-}
-
-.mine .message-time {
-    text-align: right;
-}
-
-.theirs .message-time {
-    text-align: left;
-}
-
-/* =========================================================
-   REACTIONS
-========================================================= */
+.message-time { margin-top: 4px; color: #94a3b8; font-size: 10px; }
+.mine .message-time { text-align: right; }
+.theirs .message-time { text-align: left; }
 
 .reactions-display {
     display: flex;
@@ -1385,13 +1327,8 @@ body {
     margin-top: 5px;
 }
 
-.mine .reactions-display {
-    justify-content: flex-end;
-}
-
-.theirs .reactions-display {
-    justify-content: flex-start;
-}
+.mine .reactions-display { justify-content: flex-end; }
+.theirs .reactions-display { justify-content: flex-start; }
 
 .reaction-pill {
     display: inline-flex;
@@ -1417,13 +1354,8 @@ body {
     z-index: 20;
 }
 
-.theirs .reaction-wrapper {
-    right: -45px;
-}
-
-.mine .reaction-wrapper {
-    left: -45px;
-}
+.theirs .reaction-wrapper { right: -45px; }
+.mine .reaction-wrapper { left: -45px; }
 
 .message-row:hover .reaction-wrapper {
     opacity: 1;
@@ -1468,13 +1400,8 @@ body {
     z-index: 30;
 }
 
-.theirs .reaction-popup {
-    left: 0;
-}
-
-.mine .reaction-popup {
-    right: 0;
-}
+.theirs .reaction-popup { left: 0; }
+.mine .reaction-popup { right: 0; }
 
 .reaction-wrapper:hover .reaction-popup,
 .reaction-wrapper.open .reaction-popup {
@@ -1483,10 +1410,7 @@ body {
     transform: scale(1);
 }
 
-.reaction-form {
-    margin: 0;
-    padding: 0;
-}
+.reaction-form { margin: 0; padding: 0; }
 
 .reaction-button {
     border: none;
@@ -1499,14 +1423,7 @@ body {
     border-radius: 50%;
 }
 
-.reaction-button:hover {
-    background: #f3f4f6;
-    transform: scale(1.15);
-}
-
-/* =========================================================
-   MESSAGE FORM
-========================================================= */
+.reaction-button:hover { background: #f3f4f6; transform: scale(1.15); }
 
 .message-form {
     flex-shrink: 0;
@@ -1556,15 +1473,8 @@ body {
     transition: background 0.2s, border-color 0.2s;
 }
 
-.attach-button:hover {
-    background: #eff6ff;
-    border-color: #0b3d91;
-}
-
-.attach-button.selected {
-    background: #eaf2ff;
-    border-color: #0b3d91;
-}
+.attach-button:hover { background: #eff6ff; border-color: #0b3d91; }
+.attach-button.selected { background: #eaf2ff; border-color: #0b3d91; }
 
 .send-button {
     min-height: 44px;
@@ -1583,15 +1493,7 @@ body {
     transform: translateY(-1px);
 }
 
-.send-button:disabled {
-    opacity: 0.65;
-    cursor: not-allowed;
-    transform: none;
-}
-
-/* =========================================================
-   IMAGE LIGHTBOX
-========================================================= */
+.send-button:disabled { opacity: 0.65; cursor: not-allowed; transform: none; }
 
 .image-lightbox {
     display: none;
@@ -1604,9 +1506,7 @@ body {
     padding: 30px;
 }
 
-.image-lightbox.show {
-    display: flex;
-}
+.image-lightbox.show { display: flex; }
 
 .image-lightbox img {
     max-width: 95%;
@@ -1629,10 +1529,6 @@ body {
     cursor: pointer;
 }
 
-/* =========================================================
-   EMPTY STATES
-========================================================= */
-
 .no-conversations {
     padding: 45px 20px;
     text-align: center;
@@ -1651,40 +1547,20 @@ body {
     color: #64748b;
 }
 
-.no-chat h2 {
-    color: #0b3d91;
-    margin: 0 0 8px;
-    font-size: 20px;
-}
-
-.no-chat p {
-    margin: 0;
-    font-size: 14px;
-}
-
-/* =========================================================
-   SCROLLBAR
-========================================================= */
+.no-chat h2 { color: #0b3d91; margin: 0 0 8px; font-size: 20px; }
+.no-chat p { margin: 0; font-size: 14px; }
 
 .messages-area::-webkit-scrollbar,
-.conversations::-webkit-scrollbar {
-    width: 8px;
-}
+.conversations::-webkit-scrollbar { width: 8px; }
 
 .messages-area::-webkit-scrollbar-track,
-.conversations::-webkit-scrollbar-track {
-    background: #eef2f7;
-}
+.conversations::-webkit-scrollbar-track { background: #eef2f7; }
 
 .messages-area::-webkit-scrollbar-thumb,
 .conversations::-webkit-scrollbar-thumb {
     background: #b8c4d4;
     border-radius: 10px;
 }
-
-/* =========================================================
-   RESPONSIVE
-========================================================= */
 
 @media (max-width: 900px) {
     .messaging-container {
@@ -1695,31 +1571,12 @@ body {
 }
 
 @media (max-width: 700px) {
-    .navbar {
-        padding: 10px 15px;
-    }
-
-    .brand-title {
-        font-size: 18px;
-    }
-
-    .brand-logo {
-        width: 42px;
-        height: 42px;
-    }
-
-    .profile-name {
-        display: none;
-    }
-
-    .profile-dropdown {
-        width: 290px;
-    }
-
-    .page {
-        margin: 20px auto;
-        padding: 0 10px;
-    }
+    .navbar { padding: 10px 15px; }
+    .brand-title { font-size: 18px; }
+    .brand-logo { width: 42px; height: 42px; }
+    .profile-name { display: none; }
+    .profile-dropdown { width: 290px; }
+    .page { margin: 20px auto; padding: 0 10px; }
 
     .messaging-container {
         grid-template-columns: 1fr;
@@ -1732,17 +1589,9 @@ body {
         border-bottom: 1px solid #dbe3ef;
     }
 
-    .chat {
-        min-height: 550px;
-    }
-
-    .message-content {
-        max-width: 80%;
-    }
-
-    .reaction-wrapper {
-        display: none;
-    }
+    .chat { min-height: 550px; }
+    .message-content { max-width: 80%; }
+    .reaction-wrapper { display: none; }
 }
 
 @media (max-width: 400px) {
@@ -1753,64 +1602,30 @@ body {
 }
 
 @media (max-width: 480px) {
-    .profile-button {
-        padding-right: 7px;
-    }
-
-    .page-title h1 {
-        font-size: 24px;
-    }
-
-    .message-form {
-        padding: 10px;
-        gap: 6px;
-    }
-
-    .send-button {
-        padding: 0 13px;
-    }
-
-    .messages-area {
-        padding: 15px;
-    }
-
-    .attach-button {
-        width: 40px;
-        height: 44px;
-    }
-
-    .message-form textarea {
-        min-width: 0;
-    }
-
-    .image-lightbox {
-        padding: 15px;
-    }
+    .profile-button { padding-right: 7px; }
+    .page-title h1 { font-size: 24px; }
+    .message-form { padding: 10px; gap: 6px; }
+    .send-button { padding: 0 13px; }
+    .messages-area { padding: 15px; }
+    .attach-button { width: 40px; height: 44px; }
+    .message-form textarea { min-width: 0; }
+    .image-lightbox { padding: 15px; }
 }
-
 </style>
 </head>
 
 <body>
 
-<!-- =======================================================
-     NAVBAR - UNCHANGED
-======================================================= -->
-
 <nav class="navbar">
 
     <a href="dashboard.php" class="brand">
-
-        <span class="brand-title">
-            RTU Lost and Found
-        </span>
+        <span class="brand-title">RTU Lost and Found</span>
 
         <img
             src="uploads/rtulogo.png"
             alt="RTU Logo"
             class="brand-logo"
         >
-
     </a>
 
     <div class="profile-container">
@@ -1906,10 +1721,6 @@ body {
 
 </nav>
 
-<!-- =======================================================
-     PAGE
-======================================================= -->
-
 <div class="page">
 
     <div class="page-title">
@@ -1929,25 +1740,23 @@ body {
         unset($_SESSION["message_send_status"]);
         ?>
 
-        <div class="status-notice <?php echo $send_status === "success" ? "success" : "error"; ?>">
+        <?php if ($send_status === "success"): ?>
 
-            <?php if ($send_status === "success"): ?>
-
+            <div class="status-notice success">
                 Message sent successfully.
+            </div>
 
-            <?php else: ?>
+        <?php else: ?>
 
-                Message could not be sent. Check the PHP error log for the exact reason.
+            <div class="status-notice error">
+                Unable to send your message. Please check your message or image and try again.
+            </div>
 
-            <?php endif; ?>
-
-        </div>
+        <?php endif; ?>
 
     <?php endif; ?>
 
     <div class="messaging-container">
-
-        <!-- CONVERSATION LIST -->
 
         <div class="conversations">
 
@@ -1978,7 +1787,6 @@ body {
                         );
 
                     $latest_message = $conversation["latest_message"] ?? "";
-
                     $conversation_unread = (int)($conversation["unread_count"] ?? 0);
 
                     ?>
@@ -2030,8 +1838,6 @@ body {
             <?php endif; ?>
 
         </div>
-
-        <!-- CHAT PANEL -->
 
         <?php if ($selected_user > 0 && $selected_item > 0): ?>
 
@@ -2091,8 +1897,6 @@ body {
 
                 <?php endif; ?>
 
-                <!-- MESSAGE AREA -->
-
                 <div class="messages-area" id="messagesArea">
 
                     <?php if (!empty($messages_error)): ?>
@@ -2109,14 +1913,12 @@ body {
                     <?php elseif (empty($chat_messages)): ?>
 
                         <div class="no-chat">
-
                             <div>
                                 <h2>Start a conversation</h2>
                                 <p>
                                     Send a message or an image about this item.
                                 </p>
                             </div>
-
                         </div>
 
                     <?php else: ?>
@@ -2128,30 +1930,31 @@ body {
                             $is_mine =
                                 (int)$msg["sender_id"] === $current_user_id;
 
-                            $reaction_stmt = $conn->prepare("
-                                SELECT
-                                    mr.reaction,
-                                    mr.user_id,
-                                    u.name
-                                FROM message_reactions mr
-                                INNER JOIN users u
-                                    ON u.id = mr.user_id
-                                WHERE mr.message_id = ?
-                                ORDER BY mr.created_at ASC
-                            ");
-
                             $message_reactions = [];
 
-                            if ($reaction_stmt) {
+                            try {
 
-                                $reaction_stmt->bind_param("i", $msg["id"]);
-                                $reaction_stmt->execute();
+                                $reaction_stmt = $supabase->prepare("
+                                    SELECT
+                                        mr.reaction,
+                                        mr.user_id,
+                                        u.name
+                                    FROM message_reactions mr
+                                    INNER JOIN users u
+                                        ON u.id = mr.user_id
+                                    WHERE mr.message_id = :message_id
+                                    ORDER BY mr.created_at ASC
+                                ");
 
-                                $message_reactions = $reaction_stmt
-                                    ->get_result()
-                                    ->fetch_all(MYSQLI_ASSOC);
+                                $reaction_stmt->execute([
+                                    ":message_id" => (int)$msg["id"]
+                                ]);
 
-                                $reaction_stmt->close();
+                                $message_reactions = $reaction_stmt->fetchAll(PDO::FETCH_ASSOC);
+
+                            } catch (Throwable $e) {
+
+                                error_log("RTU Reaction Display Error: " . $e->getMessage());
                             }
 
                             ?>
@@ -2196,6 +1999,18 @@ body {
                                         );
                                         ?>
                                     </div>
+
+                                    <?php if ($is_mine): ?>
+
+                                        <div
+                                            class="seen-indicator"
+                                            data-message-id="<?php echo (int)$msg["id"]; ?>"
+                                            hidden
+                                        >
+                                            Seen
+                                        </div>
+
+                                    <?php endif; ?>
 
                                     <?php if (!empty($message_reactions)): ?>
 
@@ -2312,8 +2127,6 @@ body {
 
                 </div>
 
-                <!-- IMAGE PREVIEW -->
-
                 <div
                     class="image-preview-container"
                     id="imagePreviewContainer"
@@ -2340,14 +2153,18 @@ body {
 
                 </div>
 
-                <!-- SEND MESSAGE FORM -->
-
                 <form
                     method="POST"
                     class="message-form"
                     enctype="multipart/form-data"
                     id="messageForm"
                 >
+
+                    <input
+                        type="hidden"
+                        name="send_message"
+                        value="1"
+                    >
 
                     <input
                         type="hidden"
@@ -2387,7 +2204,6 @@ body {
 
                     <button
                         type="submit"
-                        name="send_message"
                         class="send-button"
                         id="sendButton"
                     >
@@ -2421,8 +2237,6 @@ body {
     </div>
 
 </div>
-
-<!-- IMAGE LIGHTBOX -->
 
 <div
     class="image-lightbox"
@@ -2567,7 +2381,7 @@ if (messageInput && messageForm) {
             if (messageForm.requestSubmit) {
                 messageForm.requestSubmit(sendButton);
             } else {
-                sendButton.click();
+                messageForm.submit();
             }
         }
     });
@@ -2675,6 +2489,76 @@ if (messageImage && attachButton && imagePreviewContainer) {
         imagePreviewContainer.classList.remove("show");
         attachButton.classList.remove("selected");
     });
+}
+
+/* =========================================================
+   AUTOMATIC SEEN STATUS - LATEST MESSAGE ONLY
+========================================================= */
+
+const seenUserId = <?php echo (int)$selected_user; ?>;
+const seenItemId = <?php echo (int)$selected_item; ?>;
+
+async function updateSeenStatuses() {
+
+    if (seenUserId <= 0 || seenItemId <= 0) {
+        return;
+    }
+
+    const indicators = document.querySelectorAll(".seen-indicator");
+
+    if (indicators.length === 0) {
+        return;
+    }
+
+    indicators.forEach(function(indicator) {
+        indicator.hidden = true;
+    });
+
+    const latestIndicator = indicators[indicators.length - 1];
+
+    const latestMessageId = parseInt(
+        latestIndicator.dataset.messageId,
+        10
+    );
+
+    try {
+
+        const response = await fetch(
+            "messages.php?ajax=seen_status" +
+            "&user=" + encodeURIComponent(seenUserId) +
+            "&item=" + encodeURIComponent(seenItemId) +
+            "&_=" + Date.now(),
+            {
+                method: "GET",
+                credentials: "same-origin",
+                cache: "no-store"
+            }
+        );
+
+        if (!response.ok) {
+            return;
+        }
+
+        const data = await response.json();
+
+        if (!Array.isArray(data.seen_ids)) {
+            return;
+        }
+
+        if (data.seen_ids.includes(latestMessageId)) {
+            latestIndicator.hidden = false;
+        }
+
+    } catch (error) {
+        console.error("Unable to update seen status:", error);
+    }
+}
+
+if (seenUserId > 0 && seenItemId > 0) {
+
+    updateSeenStatuses();
+
+    setInterval(updateSeenStatuses, 2500);
 }
 
 /* =========================================================

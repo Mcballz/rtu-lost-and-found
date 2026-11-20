@@ -3,82 +3,239 @@
 
 session_start();
 
+/* =========================================================
+   PREVENT BROWSER CACHING
+========================================================= */
+
 header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
 header("Cache-Control: post-check=0, pre-check=0", false);
 header("Pragma: no-cache");
 header("Expires: 0");
+
+
+/* =========================================================
+   CHECK LOGIN
+========================================================= */
 
 if (!isset($_SESSION["user_id"])) {
     header("Location: ../login.php");
     exit();
 }
 
-require_once "../config/database.php";
 
-/* Check if logged-in user is an admin */
+/* =========================================================
+   SUPABASE CONNECTION
+========================================================= */
+
+try {
+    require_once __DIR__ . "/../config/supabase.php";
+
+    if (!isset($supabase) || !($supabase instanceof PDO)) {
+        throw new RuntimeException("Supabase connection unavailable.");
+    }
+
+} catch (Throwable $e) {
+
+    error_log("Admin claims connection error: " . $e->getMessage());
+
+    http_response_code(500);
+    exit("Unable to connect to the database.");
+}
+
+
+/* =========================================================
+   VERIFY ADMIN ROLE
+========================================================= */
 
 $user_id = (int) $_SESSION["user_id"];
 
-$sql = "SELECT role FROM users WHERE id = ?";
+try {
 
-$stmt = $conn->prepare($sql);
-$stmt->bind_param("i", $user_id);
-$stmt->execute();
+    $stmt = $supabase->prepare("
+        SELECT role
+        FROM users
+        WHERE id = :user_id
+        LIMIT 1
+    ");
 
-$result = $stmt->get_result();
-$user = $result->fetch_assoc();
+    $stmt->execute([
+        ":user_id" => $user_id
+    ]);
 
-$stmt->close();
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
 
-if (!$user || $user["role"] !== "admin") {
-    die("Access denied. Admins only.");
+    if (!$user || $user["role"] !== "admin") {
+        http_response_code(403);
+        exit("Access denied. Admins only.");
+    }
+
+} catch (Throwable $e) {
+
+    error_log("Admin role verification error: " . $e->getMessage());
+
+    http_response_code(500);
+    exit("Unable to verify administrator access.");
 }
 
 
-/* Approve claim */
+/* =========================================================
+   CSRF TOKEN
+========================================================= */
 
-if (isset($_GET["approve"])) {
+if (empty($_SESSION["csrf_token"])) {
+    $_SESSION["csrf_token"] = bin2hex(random_bytes(32));
+}
 
-    $claim_id = (int) $_GET["approve"];
+$csrf_token = $_SESSION["csrf_token"];
 
-    $stmt = $conn->prepare("
-        SELECT item_id
-        FROM claims
-        WHERE id = ?
-        AND status = 'pending'
-    ");
 
-    $stmt->bind_param("i", $claim_id);
-    $stmt->execute();
+/* =========================================================
+   APPROVE / REJECT CLAIM
+========================================================= */
 
-    $claim_result = $stmt->get_result();
-    $claim = $claim_result->fetch_assoc();
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
-    $stmt->close();
+    $claim_id = filter_var(
+        $_POST["claim_id"] ?? null,
+        FILTER_VALIDATE_INT
+    );
 
-    if ($claim) {
+    $action = $_POST["action"] ?? "";
+
+    $submitted_token = $_POST["csrf_token"] ?? "";
+
+    if (
+        !is_string($submitted_token) ||
+        !hash_equals($csrf_token, $submitted_token)
+    ) {
+
+        $_SESSION["claim_message"] =
+            "Invalid security token. Please refresh and try again.";
+
+        header("Location: claims.php");
+        exit();
+    }
+
+    if (
+        !$claim_id ||
+        $claim_id <= 0 ||
+        !in_array($action, ["approve", "reject"], true)
+    ) {
+
+        $_SESSION["claim_message"] =
+            "Invalid claim action.";
+
+        header("Location: claims.php");
+        exit();
+    }
+
+    try {
+
+        $supabase->beginTransaction();
+
+        $stmt = $supabase->prepare("
+            SELECT id, item_id
+            FROM claims
+            WHERE id = :claim_id
+            AND status = 'pending'
+            FOR UPDATE
+        ");
+
+        $stmt->execute([
+            ":claim_id" => $claim_id
+        ]);
+
+        $claim = $stmt->fetch(PDO::FETCH_ASSOC);
+        $stmt->closeCursor();
+
+        if (!$claim) {
+            throw new RuntimeException(
+                "This claim is no longer pending or does not exist."
+            );
+        }
 
         $item_id = (int) $claim["item_id"];
 
-        $stmt = $conn->prepare("
-            UPDATE claims
-            SET status = 'approved'
-            WHERE id = ?
-        ");
+        if ($action === "approve") {
 
-        $stmt->bind_param("i", $claim_id);
-        $stmt->execute();
-        $stmt->close();
+            $stmt = $supabase->prepare("
+                UPDATE claims
+                SET status = 'approved'
+                WHERE id = :claim_id
+                AND status = 'pending'
+            ");
 
-        $stmt = $conn->prepare("
-            UPDATE items
-            SET status = 'returned'
-            WHERE id = ?
-        ");
+            $stmt->execute([
+                ":claim_id" => $claim_id
+            ]);
 
-        $stmt->bind_param("i", $item_id);
-        $stmt->execute();
-        $stmt->close();
+            if ($stmt->rowCount() !== 1) {
+                throw new RuntimeException(
+                    "Unable to approve this claim."
+                );
+            }
+
+            $stmt = $supabase->prepare("
+                UPDATE items
+                SET status = 'returned'
+                WHERE id = :item_id
+            ");
+
+            $stmt->execute([
+                ":item_id" => $item_id
+            ]);
+
+            $_SESSION["claim_message"] =
+                "Claim approved successfully.";
+
+        } else {
+
+            $stmt = $supabase->prepare("
+                UPDATE claims
+                SET status = 'rejected'
+                WHERE id = :claim_id
+                AND status = 'pending'
+            ");
+
+            $stmt->execute([
+                ":claim_id" => $claim_id
+            ]);
+
+            if ($stmt->rowCount() !== 1) {
+                throw new RuntimeException(
+                    "Unable to reject this claim."
+                );
+            }
+
+            $stmt = $supabase->prepare("
+                UPDATE items
+                SET status = 'found'
+                WHERE id = :item_id
+            ");
+
+            $stmt->execute([
+                ":item_id" => $item_id
+            ]);
+
+            $_SESSION["claim_message"] =
+                "Claim rejected successfully.";
+        }
+
+        $supabase->commit();
+
+    } catch (Throwable $e) {
+
+        if ($supabase->inTransaction()) {
+            $supabase->rollBack();
+        }
+
+        error_log("Admin claim action error: " . $e->getMessage());
+
+        $_SESSION["claim_message"] =
+            $e instanceof RuntimeException
+                ? $e->getMessage()
+                : "Unable to process this claim. Please try again.";
     }
 
     header("Location: claims.php");
@@ -86,60 +243,17 @@ if (isset($_GET["approve"])) {
 }
 
 
-/* Reject claim */
+/* =========================================================
+   GET ALL CLAIMS
+========================================================= */
 
-if (isset($_GET["reject"])) {
+$claims = [];
+$database_error = false;
 
-    $claim_id = (int) $_GET["reject"];
+try {
 
-    $stmt = $conn->prepare("
-        SELECT item_id
-        FROM claims
-        WHERE id = ?
-        AND status = 'pending'
-    ");
-
-    $stmt->bind_param("i", $claim_id);
-    $stmt->execute();
-
-    $claim_result = $stmt->get_result();
-    $claim = $claim_result->fetch_assoc();
-
-    $stmt->close();
-
-    if ($claim) {
-
-        $item_id = (int) $claim["item_id"];
-
-        $stmt = $conn->prepare("
-            UPDATE claims
-            SET status = 'rejected'
-            WHERE id = ?
-        ");
-
-        $stmt->bind_param("i", $claim_id);
-        $stmt->execute();
-        $stmt->close();
-
-        $stmt = $conn->prepare("
-            UPDATE items
-            SET status = 'found'
-            WHERE id = ?
-        ");
-
-        $stmt->bind_param("i", $item_id);
-        $stmt->execute();
-        $stmt->close();
-    }
-
-    header("Location: claims.php");
-    exit();
-}
-
-
-/* Get all claims */
-
-$sql = "SELECT
+    $stmt = $supabase->query("
+        SELECT
             claims.*,
             items.item_name,
             items.category,
@@ -152,15 +266,37 @@ $sql = "SELECT
 
         FROM claims
 
-        JOIN items
+        INNER JOIN items
             ON claims.item_id = items.id
 
-        JOIN users
+        INNER JOIN users
             ON claims.user_id = users.id
 
-        ORDER BY claims.created_at DESC";
+        ORDER BY claims.created_at DESC
+    ");
 
-$result = $conn->query($sql);
+    $claims = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+} catch (Throwable $e) {
+
+    error_log("Admin claims retrieval error: " . $e->getMessage());
+
+    $database_error = true;
+    $claims = [];
+}
+
+
+/* =========================================================
+   ESCAPE OUTPUT HELPER
+========================================================= */
+
+function claimEscape($value) {
+    return htmlspecialchars(
+        (string) ($value ?? ""),
+        ENT_QUOTES,
+        "UTF-8"
+    );
+}
 
 ?>
 
@@ -180,9 +316,7 @@ $result = $conn->query($sql);
 
 <style>
 
-/* =========================================================
-   GLOBAL
-========================================================= */
+/* GLOBAL */
 
 * {
     box-sizing: border-box;
@@ -206,9 +340,7 @@ a {
 }
 
 
-/* =========================================================
-   TOP NAVBAR
-========================================================= */
+/* TOP NAVBAR */
 
 .navbar {
     width: 100%;
@@ -256,9 +388,8 @@ a {
     flex-shrink: 0;
 }
 
-/* =========================================================
-   ADMIN NAVIGATION
-========================================================= */
+
+/* ADMIN NAVIGATION */
 
 .admin-nav {
     width: 100%;
@@ -279,7 +410,6 @@ a {
     padding: 0 15px;
     border-radius: 7px;
     color: #24364b;
-    text-decoration: none;
     font-size: 13px;
     font-weight: 600;
     transition: 0.18s;
@@ -297,9 +427,7 @@ a {
 }
 
 
-/* =========================================================
-   MAIN CONTAINER
-========================================================= */
+/* MAIN CONTAINER */
 
 .container {
     width: 92%;
@@ -308,9 +436,7 @@ a {
 }
 
 
-/* =========================================================
-   PAGE HEADER
-========================================================= */
+/* PAGE HEADER */
 
 .page-header {
     background: white;
@@ -333,21 +459,16 @@ a {
 }
 
 
-/* =========================================================
-   CLAIM CARD
-========================================================= */
+/* CLAIM CARD */
 
 .claim-card {
     background: white;
     padding: 26px;
     margin-bottom: 22px;
-
     border-radius: 14px;
     border: 1px solid #e5e7eb;
     border-top: 3px solid #d4af37;
-
     box-shadow: 0 3px 14px rgba(0, 0, 0, 0.06);
-
     transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
 
@@ -365,9 +486,7 @@ a {
 }
 
 
-/* =========================================================
-   CLAIM INFORMATION
-========================================================= */
+/* CLAIM INFORMATION */
 
 .claim-info {
     line-height: 1.8;
@@ -384,17 +503,74 @@ a {
 }
 
 
-/* =========================================================
-   INFORMATION SECTIONS
-========================================================= */
+/* CLAIM VERIFICATION CODE */
+
+.verification-box {
+    margin-top: 18px;
+    padding: 18px;
+    background: #f8fafc;
+    border: 1px solid #dbe3ee;
+    border-left: 4px solid #d4af37;
+    border-radius: 9px;
+}
+
+.verification-title {
+    color: #0f2f5f;
+    font-size: 13px;
+    font-weight: bold;
+    margin-bottom: 10px;
+}
+
+.verification-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.verification-code {
+    flex: 1;
+    padding: 12px;
+    background: white;
+    border: 1px solid #cbd5e1;
+    border-radius: 7px;
+    color: #0b4178;
+    font-size: 17px;
+    font-weight: bold;
+    letter-spacing: 1px;
+    overflow-wrap: anywhere;
+}
+
+.copy-button {
+    border: none;
+    background: #0b5cab;
+    color: white;
+    padding: 12px 17px;
+    border-radius: 7px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: bold;
+    transition: 0.2s;
+}
+
+.copy-button:hover {
+    background: #084b8a;
+}
+
+.copy-feedback {
+    min-height: 17px;
+    margin-top: 8px;
+    font-size: 12px;
+    color: #166534;
+}
+
+
+/* INFORMATION SECTIONS */
 
 .info-section {
     margin-top: 18px;
     padding: 19px;
-
     background: #f8fafc;
     border-radius: 9px;
-
     border: 1px solid #e2e8f0;
     border-left: 4px solid #164a8a;
 }
@@ -413,9 +589,7 @@ a {
 }
 
 
-/* =========================================================
-   STATUS BADGES
-========================================================= */
+/* STATUS BADGES */
 
 .badge {
     display: inline-block;
@@ -445,9 +619,7 @@ a {
 }
 
 
-/* =========================================================
-   PROOF IMAGE
-========================================================= */
+/* PROOF IMAGE */
 
 .proof-image {
     width: 220px;
@@ -455,7 +627,6 @@ a {
     object-fit: contain;
     display: block;
     margin-top: 10px;
-
     background: white;
     border: 1px solid #d1d5db;
     border-radius: 8px;
@@ -463,18 +634,14 @@ a {
 }
 
 
-/* =========================================================
-   ACTION BUTTONS
-========================================================= */
+/* ACTION BUTTONS */
 
 .actions {
     display: flex;
     gap: 10px;
     flex-wrap: wrap;
-
     margin-top: 22px;
     padding-top: 20px;
-
     border-top: 1px solid #e5e7eb;
 }
 
@@ -483,13 +650,11 @@ a {
     padding: 10px 17px;
     border-radius: 7px;
     border: none;
-
     color: white;
     font-size: 14px;
     font-weight: 600;
     cursor: pointer;
     text-align: center;
-
     transition: 0.2s ease;
 }
 
@@ -517,10 +682,12 @@ a {
     background: #164a8a;
 }
 
+.action-form {
+    display: inline;
+}
 
-/* =========================================================
-   EMPTY STATE
-========================================================= */
+
+/* EMPTY STATE */
 
 .empty {
     background: white;
@@ -528,10 +695,8 @@ a {
     border-radius: 14px;
     text-align: center;
     color: #6b7280;
-
     border: 1px solid #e5e7eb;
     border-top: 3px solid #d4af37;
-
     box-shadow: 0 3px 14px rgba(0, 0, 0, 0.06);
 }
 
@@ -540,9 +705,29 @@ a {
 }
 
 
-/* =========================================================
-   RESPONSIVE
-========================================================= */
+/* ALERT MESSAGES */
+
+.alert {
+    padding: 14px 18px;
+    margin-bottom: 20px;
+    border-radius: 9px;
+    font-size: 14px;
+}
+
+.alert.error {
+    color: #991b1b;
+    background: #fee2e2;
+    border: 1px solid #fecaca;
+}
+
+.alert.success {
+    color: #166534;
+    background: #ecfdf5;
+    border: 1px solid #bbf7d0;
+}
+
+
+/* RESPONSIVE */
 
 @media (max-width: 850px) {
 
@@ -568,6 +753,7 @@ a {
     .claim-card {
         padding: 22px;
     }
+
 }
 
 @media (max-width: 600px) {
@@ -583,9 +769,11 @@ a {
 
     .admin-nav {
         gap: 5px;
+        overflow-x: auto;
     }
 
     .admin-nav a {
+        flex-shrink: 0;
         padding: 8px 9px;
         font-size: 12px;
     }
@@ -607,21 +795,33 @@ a {
         flex-direction: column;
     }
 
-    .button {
+    .button,
+    .action-form {
         width: 100%;
     }
+
+    .verification-row {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .verification-code,
+    .copy-button {
+        width: 100%;
+        text-align: center;
+    }
+
 }
 
 
-/* =========================================================
-   PRINT
-========================================================= */
+/* PRINT */
 
 @media print {
 
     .navbar,
     .admin-nav,
-    .actions {
+    .actions,
+    .copy-button {
         display: none;
     }
 
@@ -634,9 +834,7 @@ a {
 <body>
 
 
-<!-- =========================================================
-     TOP NAVIGATION
-========================================================= -->
+<!-- TOP NAVIGATION -->
 
 <header class="navbar">
 
@@ -658,9 +856,7 @@ a {
 </header>
 
 
-<!-- =========================================================
-     ADMIN NAVIGATION
-========================================================= -->
+<!-- ADMIN NAVIGATION -->
 
 <nav class="admin-nav">
 
@@ -683,9 +879,7 @@ a {
 </nav>
 
 
-<!-- =========================================================
-     MAIN CONTENT
-========================================================= -->
+<!-- MAIN CONTENT -->
 
 <div class="container">
 
@@ -700,16 +894,38 @@ a {
     </div>
 
 
-    <?php if ($result && $result->num_rows > 0): ?>
+    <?php if (isset($_SESSION["claim_message"])): ?>
 
-        <?php while ($claim = $result->fetch_assoc()): ?>
+        <?php
+        $claim_message = $_SESSION["claim_message"];
+        unset($_SESSION["claim_message"]);
+        ?>
+
+        <div class="alert <?php
+            echo (
+                strpos(strtolower($claim_message), "successfully") !== false
+            ) ? "success" : "error";
+        ?>">
+            <?php echo claimEscape($claim_message); ?>
+        </div>
+
+    <?php endif; ?>
+
+
+    <?php if ($database_error): ?>
+
+        <div class="alert error">
+            Unable to load claims. Please check your database connection and try again.
+        </div>
+
+    <?php elseif (!empty($claims)): ?>
+
+        <?php foreach ($claims as $claim): ?>
 
             <div class="claim-card">
 
                 <h2>
-                    <?php
-                    echo htmlspecialchars($claim["item_name"]);
-                    ?>
+                    <?php echo claimEscape($claim["item_name"]); ?>
                 </h2>
 
 
@@ -722,28 +938,70 @@ a {
 
                     <p>
                         <strong>Category:</strong>
-                        <?php echo htmlspecialchars($claim["category"]); ?>
+                        <?php echo claimEscape($claim["category"]); ?>
                     </p>
 
                     <p>
                         <strong>Location:</strong>
-                        <?php echo htmlspecialchars($claim["location"]); ?>
+                        <?php echo claimEscape($claim["location"]); ?>
                     </p>
 
                     <p>
                         <strong>Date Reported:</strong>
-                        <?php echo htmlspecialchars($claim["date_reported"]); ?>
+                        <?php echo claimEscape($claim["date_reported"]); ?>
                     </p>
 
                     <p>
                         <strong>Claim Status:</strong>
 
-                        <span class="badge <?php echo htmlspecialchars($claim["status"]); ?>">
-                            <?php
-                            echo htmlspecialchars(ucfirst($claim["status"]));
-                            ?>
+                        <span class="badge <?php echo claimEscape($claim["status"]); ?>">
+                            <?php echo claimEscape(ucfirst($claim["status"])); ?>
                         </span>
+
                     </p>
+
+                </div>
+
+
+                <!-- CLAIM VERIFICATION CODE -->
+
+                <div class="verification-box">
+
+                    <div class="verification-title">
+                        CLAIM VERIFICATION CODE
+                    </div>
+
+                    <?php if (!empty($claim["verification_code"])): ?>
+
+                        <div class="verification-row">
+
+                            <div
+                                class="verification-code"
+                                id="claim-code-<?php echo (int) $claim["id"]; ?>"
+                            ><?php echo claimEscape($claim["verification_code"]); ?></div>
+
+                            <button
+                                type="button"
+                                class="copy-button"
+                                onclick="copyClaimCode(<?php echo (int) $claim["id"]; ?>)"
+                            >
+                                Copy Code
+                            </button>
+
+                        </div>
+
+                        <div
+                            class="copy-feedback"
+                            id="copy-feedback-<?php echo (int) $claim["id"]; ?>"
+                        ></div>
+
+                    <?php else: ?>
+
+                        <p>
+                            No verification code is available for this claim.
+                        </p>
+
+                    <?php endif; ?>
 
                 </div>
 
@@ -756,17 +1014,17 @@ a {
 
                     <p>
                         <strong>Name:</strong>
-                        <?php echo htmlspecialchars($claim["name"]); ?>
+                        <?php echo claimEscape($claim["name"]); ?>
                     </p>
 
                     <p>
                         <strong>Student ID:</strong>
-                        <?php echo htmlspecialchars($claim["student_id"]); ?>
+                        <?php echo claimEscape($claim["student_id"]); ?>
                     </p>
 
                     <p>
                         <strong>Email:</strong>
-                        <?php echo htmlspecialchars($claim["email"]); ?>
+                        <?php echo claimEscape($claim["email"]); ?>
                     </p>
 
                 </div>
@@ -780,7 +1038,9 @@ a {
 
                     <p>
                         <?php
-                        echo nl2br(htmlspecialchars($claim["item_description"]));
+                        echo nl2br(
+                            claimEscape($claim["item_description"])
+                        );
                         ?>
                     </p>
 
@@ -799,7 +1059,7 @@ a {
                         if (!empty($claim["claim_description"])) {
 
                             echo nl2br(
-                                htmlspecialchars($claim["claim_description"])
+                                claimEscape($claim["claim_description"])
                             );
 
                         } else {
@@ -823,9 +1083,14 @@ a {
                         <h3>Proof Image</h3>
 
                         <img
-                            src="../uploads/claims/<?php echo htmlspecialchars($claim["proof_image"]); ?>"
+                            src="../uploads/claims/<?php
+                                echo rawurlencode(
+                                    basename((string) $claim["proof_image"])
+                                );
+                            ?>"
                             alt="Claim Proof"
                             class="proof-image"
+                            loading="lazy"
                         >
 
                     </div>
@@ -835,53 +1100,60 @@ a {
 
                 <!-- ACTIONS -->
 
-                <?php if ($claim["status"] === "pending"): ?>
+                <div class="actions">
 
-                    <div class="actions">
+                    <?php if ($claim["status"] === "pending"): ?>
 
-                        <a
-                            href="claims.php?approve=<?php echo (int) $claim["id"]; ?>"
-                            class="button approve"
-                            onclick="return confirm('Are you sure you want to approve this claim?');"
-                        >
-                            Approve
-                        </a>
+                        <form method="POST" class="action-form"
+                              onsubmit="return confirm('Are you sure you want to approve this claim?');">
 
-                        <a
-                            href="claims.php?reject=<?php echo (int) $claim["id"]; ?>"
-                            class="button reject"
-                            onclick="return confirm('Are you sure you want to reject this claim?');"
-                        >
-                            Reject
-                        </a>
+                            <input type="hidden" name="csrf_token"
+                                   value="<?php echo claimEscape($csrf_token); ?>">
 
-                        <a
-                            href="../item.php?id=<?php echo (int) $claim["item_id"]; ?>"
-                            class="button view"
-                        >
-                            View Item
-                        </a>
+                            <input type="hidden" name="claim_id"
+                                   value="<?php echo (int) $claim["id"]; ?>">
 
-                    </div>
+                            <input type="hidden" name="action" value="approve">
 
-                <?php else: ?>
+                            <button type="submit" class="button approve">
+                                Approve
+                            </button>
 
-                    <div class="actions">
+                        </form>
 
-                        <a
-                            href="../item.php?id=<?php echo (int) $claim["item_id"]; ?>"
-                            class="button view"
-                        >
-                            View Item
-                        </a>
 
-                    </div>
+                        <form method="POST" class="action-form"
+                              onsubmit="return confirm('Are you sure you want to reject this claim?');">
 
-                <?php endif; ?>
+                            <input type="hidden" name="csrf_token"
+                                   value="<?php echo claimEscape($csrf_token); ?>">
+
+                            <input type="hidden" name="claim_id"
+                                   value="<?php echo (int) $claim["id"]; ?>">
+
+                            <input type="hidden" name="action" value="reject">
+
+                            <button type="submit" class="button reject">
+                                Reject
+                            </button>
+
+                        </form>
+
+                    <?php endif; ?>
+
+
+                    <a
+                        href="../item.php?id=<?php echo (int) $claim["item_id"]; ?>"
+                        class="button view"
+                    >
+                        View Item
+                    </a>
+
+                </div>
 
             </div>
 
-        <?php endwhile; ?>
+        <?php endforeach; ?>
 
     <?php else: ?>
 
@@ -896,9 +1168,72 @@ a {
 
 <script>
 
-/* Prevent back/forward cache */
+/* COPY CLAIM VERIFICATION CODE */
 
-window.addEventListener("pageshow", function (event) {
+function copyClaimCode(claimId) {
+
+    const codeElement = document.getElementById("claim-code-" + claimId);
+    const feedback = document.getElementById("copy-feedback-" + claimId);
+
+    if (!codeElement || !feedback) {
+        return;
+    }
+
+    const code = codeElement.textContent.trim();
+
+    if (navigator.clipboard && window.isSecureContext) {
+
+        navigator.clipboard.writeText(code)
+            .then(function() {
+                feedback.textContent = "Claim verification code copied.";
+            })
+            .catch(function() {
+                fallbackCopyClaimCode(code, feedback);
+            });
+
+    } else {
+
+        fallbackCopyClaimCode(code, feedback);
+
+    }
+
+}
+
+
+function fallbackCopyClaimCode(code, feedback) {
+
+    const temporaryInput = document.createElement("textarea");
+
+    temporaryInput.value = code;
+    temporaryInput.style.position = "fixed";
+    temporaryInput.style.opacity = "0";
+
+    document.body.appendChild(temporaryInput);
+
+    temporaryInput.select();
+
+    try {
+
+        const copied = document.execCommand("copy");
+
+        feedback.textContent = copied
+            ? "Claim verification code copied."
+            : "Please copy the code manually.";
+
+    } catch (error) {
+
+        feedback.textContent = "Please copy the code manually.";
+
+    }
+
+    document.body.removeChild(temporaryInput);
+
+}
+
+
+/* PREVENT BACK/FORWARD CACHE */
+
+window.addEventListener("pageshow", function(event) {
 
     if (event.persisted) {
         window.location.reload();
@@ -907,7 +1242,6 @@ window.addEventListener("pageshow", function (event) {
 });
 
 </script>
-
 
 </body>
 </html>

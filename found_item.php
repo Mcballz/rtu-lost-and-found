@@ -3,37 +3,75 @@
 
 session_start();
 
-/* PREVENT BROWSER CACHING */
+/* =========================================================
+   PREVENT BROWSER CACHING
+========================================================= */
+
 header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
 header("Cache-Control: post-check=0, pre-check=0", false);
 header("Pragma: no-cache");
 header("Expires: 0");
 
-/* LOGIN CHECK */
+/* =========================================================
+   LOGIN CHECK
+========================================================= */
+
 if (!isset($_SESSION["user_id"])) {
     header("Location: login.php");
     exit();
 }
 
-/* DATABASE */
-require_once "config/database.php";
+/* =========================================================
+   DATABASE - SUPABASE PDO
+========================================================= */
+
+require_once __DIR__ . "/config/supabase.php";
 
 $user_id = (int) $_SESSION["user_id"];
+
 $error = "";
 $success = "";
+$verification_code = "";
 
-/* CURRENT USER */
-$user_stmt = $conn->prepare("
-    SELECT name, email, role
-    FROM users
-    WHERE id = ?
-");
+/* =========================================================
+   HELPER FUNCTION
+========================================================= */
 
-$user_stmt->bind_param("i", $user_id);
-$user_stmt->execute();
+function e($value) {
+    return htmlspecialchars((string) $value, ENT_QUOTES, "UTF-8");
+}
 
-$current_user = $user_stmt->get_result()->fetch_assoc();
-$user_stmt->close();
+/* =========================================================
+   CURRENT USER
+========================================================= */
+
+try {
+
+    $user_stmt = $supabase->prepare("
+        SELECT name, email, role
+        FROM users
+        WHERE id = :user_id
+        LIMIT 1
+    ");
+
+    $user_stmt->execute([
+        ":user_id" => $user_id
+    ]);
+
+    $current_user = $user_stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$current_user) {
+        session_destroy();
+        header("Location: login.php");
+        exit();
+    }
+
+} catch (PDOException $e) {
+
+    error_log("Current user query error: " . $e->getMessage());
+    die("Unable to load your account information. Please try again later.");
+
+}
 
 $current_name = $current_user["name"] ?? "User";
 $current_email = $current_user["email"] ?? "";
@@ -44,7 +82,10 @@ if ($profile_initial === "") {
     $profile_initial = "U";
 }
 
-/* FORM SUBMISSION */
+/* =========================================================
+   FORM SUBMISSION
+========================================================= */
+
 if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
     $item_name = trim($_POST["item_name"] ?? "");
@@ -53,7 +94,10 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
     $location = trim($_POST["location"] ?? "");
     $date_reported = $_POST["date_reported"] ?? "";
 
-    /* VALIDATION */
+    /* =====================================================
+       VALIDATION
+    ===================================================== */
+
     if (
         $item_name === "" ||
         $category === "" ||
@@ -61,12 +105,14 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
         $location === "" ||
         $date_reported === ""
     ) {
+
         $error = "Please fill in all required fields.";
 
     } elseif (
         !isset($_FILES["image"]) ||
         $_FILES["image"]["error"] !== UPLOAD_ERR_OK
     ) {
+
         $error = "Please upload an image of the found item.";
 
     } else {
@@ -84,106 +130,155 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
             pathinfo($image["name"], PATHINFO_EXTENSION)
         );
 
-        /* IMAGE VALIDATION */
+        /* =================================================
+           IMAGE VALIDATION
+        ================================================= */
+
         if (!in_array($extension, $allowed_extensions, true)) {
+
             $error = "Invalid image format. Please use JPG, JPEG, PNG, or WEBP.";
 
         } elseif ($image["size"] > 10 * 1024 * 1024) {
+
             $error = "Image is too large. Maximum size is 10MB.";
+
+        } elseif (!getimagesize($image["tmp_name"])) {
+
+            $error = "The uploaded file is not a valid image.";
 
         } else {
 
-            /* UPLOAD FOLDER */
-            $upload_folder = "uploads/found/";
+            /* =============================================
+               UPLOAD FOLDER
+            ============================================= */
+
+            $upload_folder = __DIR__ . "/uploads/found/";
 
             if (!is_dir($upload_folder)) {
-                if (!mkdir($upload_folder, 0777, true) && !is_dir($upload_folder)) {
+
+                if (
+                    !mkdir($upload_folder, 0777, true) &&
+                    !is_dir($upload_folder)
+                ) {
+
                     $error = "Failed to create the image upload folder.";
+
                 }
+
             }
 
             if ($error === "") {
 
-                /* IMAGE NAME */
-                $image_name = "found_" . bin2hex(random_bytes(6)) . "." . $extension;
+                /* =========================================
+                   IMAGE NAME
+                ========================================= */
+
+                $image_name = "found_" .
+                    bin2hex(random_bytes(6)) .
+                    "." . $extension;
+
                 $image_path = $upload_folder . $image_name;
 
-                /* MOVE IMAGE */
+                /* =========================================
+                   MOVE IMAGE
+                ========================================= */
+
                 if (!move_uploaded_file($image["tmp_name"], $image_path)) {
+
                     $error = "Failed to upload image.";
 
                 } else {
 
-                    /* INSERT FOUND ITEM */
-                    $insert_stmt = $conn->prepare("
-                        INSERT INTO items
-                        (
-                            user_id,
-                            item_type,
-                            item_name,
-                            category,
-                            description,
-                            location,
-                            date_reported,
-                            image,
-                            status
-                        )
-                        VALUES
-                        (
-                            ?,
-                            'found',
-                            ?,
-                            ?,
-                            ?,
-                            ?,
-                            ?,
-                            ?,
-                            'found'
-                        )
-                    ");
+                    /* =====================================
+                       GENERATE VERIFICATION CODE
+                    ===================================== */
 
-                    if (!$insert_stmt) {
-                        $error = "Unable to prepare the found-item record.";
+                    $verification_code = "RTU-FND-" .
+                        strtoupper(bin2hex(random_bytes(8)));
 
-                    } else {
+                    /* =====================================
+                       INSERT FOUND ITEM INTO SUPABASE
+                    ===================================== */
 
-                        $insert_stmt->bind_param(
-                            "issssss",
-                            $user_id,
-                            $item_name,
-                            $category,
-                            $description,
-                            $location,
-                            $date_reported,
-                            $image_name
-                        );
+                    try {
 
-                        if (!$insert_stmt->execute()) {
-                            $error = "Failed to save the found item.";
+                        $insert_stmt = $supabase->prepare("
+                            INSERT INTO items
+                            (
+                                user_id,
+                                item_type,
+                                item_name,
+                                category,
+                                description,
+                                location,
+                                date_reported,
+                                image,
+                                status,
+                                verification_code
+                            )
+                            VALUES
+                            (
+                                :user_id,
+                                'found',
+                                :item_name,
+                                :category,
+                                :description,
+                                :location,
+                                :date_reported,
+                                :image,
+                                'found',
+                                :verification_code
+                            )
+                            RETURNING id
+                        ");
 
-                            if (file_exists($image_path)) {
-                                unlink($image_path);
-                            }
+                        $insert_stmt->execute([
+                            ":user_id" => $user_id,
+                            ":item_name" => $item_name,
+                            ":category" => $category,
+                            ":description" => $description,
+                            ":location" => $location,
+                            ":date_reported" => $date_reported,
+                            ":image" => $image_name,
+                            ":verification_code" => $verification_code
+                        ]);
 
-                        } else {
+                        $new_item_id = $insert_stmt->fetchColumn();
 
-                            /*
-                             * OLD AUTOMATIC AI MATCHING REMOVED.
-                             *
-                             * The newer hybrid AI matching process
-                             * remains separate and is accessed through
-                             * the matching feature in My Reports.
-                             */
-
-                            $success = "Found item reported successfully.";
+                        if (!$new_item_id) {
+                            throw new RuntimeException(
+                                "The item report was not saved."
+                            );
                         }
 
-                        $insert_stmt->close();
+                        $success = "Found item reported successfully.";
+
+                    } catch (Throwable $e) {
+
+                        error_log(
+                            "Found item insertion error: " . $e->getMessage()
+                        );
+
+                        $error = "Failed to save the found item. Please try again.";
+
+                        $verification_code = "";
+
+                        /* REMOVE IMAGE IF DATABASE INSERT FAILS */
+
+                        if (file_exists($image_path)) {
+                            unlink($image_path);
+                        }
+
                     }
+
                 }
+
             }
+
         }
+
     }
+
 }
 
 ?>
@@ -503,6 +598,56 @@ body {
     font-size: 14px;
 }
 
+/* VERIFICATION CODE */
+
+.verification-box {
+    margin-top: 15px;
+    padding: 17px;
+    background: white;
+    border: 1px solid #bbf7d0;
+    border-radius: 9px;
+}
+
+.verification-title {
+    display: block;
+    color: #166534;
+    font-size: 14px;
+    font-weight: 700;
+    margin-bottom: 10px;
+}
+
+.verification-code {
+    display: block;
+    color: #0f2f5f;
+    font-size: 23px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    overflow-wrap: anywhere;
+    margin-bottom: 12px;
+}
+
+.copy-code-button {
+    padding: 9px 15px;
+    background: #0f2f5f;
+    color: white;
+    border: none;
+    border-radius: 7px;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 13px;
+}
+
+.copy-code-button:hover {
+    background: #164a8a;
+}
+
+.verification-note {
+    margin-top: 11px;
+    color: #475569;
+    font-size: 12px;
+    line-height: 1.6;
+}
+
 /* FORM */
 
 .form-group {
@@ -649,6 +794,10 @@ input[type="file"] {
     .card {
         padding: 20px;
     }
+
+    .verification-code {
+        font-size: 19px;
+    }
 }
 
 @media (max-width: 450px) {
@@ -700,11 +849,11 @@ input[type="file"] {
         >
 
             <span class="profile-name">
-                <?php echo htmlspecialchars($current_name); ?>
+                <?php echo e($current_name); ?>
             </span>
 
             <span class="profile-circle">
-                <?php echo htmlspecialchars($profile_initial); ?>
+                <?php echo e($profile_initial); ?>
             </span>
 
             <span class="profile-arrow" id="profileArrow"></span>
@@ -716,17 +865,17 @@ input[type="file"] {
             <div class="profile-menu-header">
 
                 <div class="profile-header-circle">
-                    <?php echo htmlspecialchars($profile_initial); ?>
+                    <?php echo e($profile_initial); ?>
                 </div>
 
                 <div class="profile-menu-details">
 
                     <div class="profile-menu-name">
-                        <?php echo htmlspecialchars($current_name); ?>
+                        <?php echo e($current_name); ?>
                     </div>
 
                     <div class="profile-menu-email">
-                        <?php echo htmlspecialchars($current_email); ?>
+                        <?php echo e($current_email); ?>
                     </div>
 
                 </div>
@@ -777,7 +926,7 @@ input[type="file"] {
         <?php if ($error !== ""): ?>
 
             <div class="error">
-                <?php echo htmlspecialchars($error); ?>
+                <?php echo e($error); ?>
             </div>
 
         <?php endif; ?>
@@ -785,7 +934,37 @@ input[type="file"] {
         <?php if ($success !== ""): ?>
 
             <div class="success">
-                <?php echo htmlspecialchars($success); ?>
+
+                <?php echo e($success); ?>
+
+                <div class="verification-box">
+
+                    <span class="verification-title">
+                        Your Item Verification Code
+                    </span>
+
+                    <span
+                        class="verification-code"
+                        id="verificationCode"
+                    ><?php echo e($verification_code); ?></span>
+
+                    <button
+                        type="button"
+                        class="copy-code-button"
+                        onclick="copyVerificationCode()"
+                    >
+                        Copy Verification Code
+                    </button>
+
+                    <p class="verification-note">
+                        Keep this code safe. You can also find it in My Reports.
+                        Provide this code to an administrator when asking them
+                        to look up your report. This code identifies your report
+                        but does not serve as proof of item ownership.
+                    </p>
+
+                </div>
+
             </div>
 
             <br>
@@ -807,7 +986,7 @@ input[type="file"] {
                     id="item_name"
                     name="item_name"
                     placeholder="Example: Black cellphone"
-                    value="<?php echo htmlspecialchars($_POST["item_name"] ?? ""); ?>"
+                    value="<?php echo e($_POST["item_name"] ?? ""); ?>"
                     required
                 >
 
@@ -851,10 +1030,10 @@ input[type="file"] {
                     ?>
 
                         <option
-                            value="<?php echo htmlspecialchars($cat); ?>"
+                            value="<?php echo e($cat); ?>"
                             <?php echo (($_POST["category"] ?? "") === $cat) ? "selected" : ""; ?>
                         >
-                            <?php echo htmlspecialchars($cat); ?>
+                            <?php echo e($cat); ?>
                         </option>
 
                     <?php endforeach; ?>
@@ -876,7 +1055,7 @@ input[type="file"] {
                     name="description"
                     placeholder="Describe the item, including color, design, brand, or other details."
                     required
-                ><?php echo htmlspecialchars($_POST["description"] ?? ""); ?></textarea>
+                ><?php echo e($_POST["description"] ?? ""); ?></textarea>
 
             </div>
 
@@ -893,7 +1072,7 @@ input[type="file"] {
                     id="location"
                     name="location"
                     placeholder="Example: RTU Library"
-                    value="<?php echo htmlspecialchars($_POST["location"] ?? ""); ?>"
+                    value="<?php echo e($_POST["location"] ?? ""); ?>"
                     required
                 >
 
@@ -911,7 +1090,7 @@ input[type="file"] {
                     type="date"
                     id="date_reported"
                     name="date_reported"
-                    value="<?php echo htmlspecialchars($_POST["date_reported"] ?? date("Y-m-d")); ?>"
+                    value="<?php echo e($_POST["date_reported"] ?? date("Y-m-d")); ?>"
                     required
                 >
 
@@ -1016,6 +1195,48 @@ document.addEventListener("click", function(event) {
     }
 
 });
+
+/* COPY VERIFICATION CODE */
+
+function copyVerificationCode() {
+
+    const codeElement = document.getElementById("verificationCode");
+
+    if (!codeElement) {
+        return;
+    }
+
+    const code = codeElement.textContent.trim();
+
+    if (navigator.clipboard && window.isSecureContext) {
+
+        navigator.clipboard.writeText(code).then(function() {
+            alert("Verification code copied successfully.");
+        }).catch(function() {
+            alert("Unable to copy the code. Please copy it manually.");
+        });
+
+    } else {
+
+        const temporaryInput = document.createElement("textarea");
+
+        temporaryInput.value = code;
+        document.body.appendChild(temporaryInput);
+
+        temporaryInput.select();
+
+        try {
+            document.execCommand("copy");
+            alert("Verification code copied successfully.");
+        } catch (error) {
+            alert("Unable to copy the code. Please copy it manually.");
+        }
+
+        document.body.removeChild(temporaryInput);
+
+    }
+
+}
 
 /* PREVENT BACK/FORWARD CACHE */
 

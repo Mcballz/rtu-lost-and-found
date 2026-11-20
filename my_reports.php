@@ -1,9 +1,6 @@
-
 <?php
 
 session_start();
-
-require_once "config/database.php";
 
 /* =========================================================
    PREVENT BROWSER CACHING
@@ -23,23 +20,30 @@ if (!isset($_SESSION["user_id"])) {
     exit();
 }
 
+/* =========================================================
+   SUPABASE CONNECTION
+========================================================= */
+
+require_once __DIR__ . "/config/supabase.php";
+
 $user_id = (int) $_SESSION["user_id"];
 
 /* =========================================================
    GET CURRENT USER
 ========================================================= */
 
-$user_stmt = $conn->prepare("
+$user_stmt = $supabase->prepare("
     SELECT id, student_id, name, email, role
     FROM users
-    WHERE id = ?
+    WHERE id = :user_id
     LIMIT 1
 ");
 
-$user_stmt->bind_param("i", $user_id);
-$user_stmt->execute();
+$user_stmt->execute([
+    ":user_id" => $user_id
+]);
 
-$current_user = $user_stmt->get_result()->fetch_assoc();
+$current_user = $user_stmt->fetch(PDO::FETCH_ASSOC);
 
 if (!$current_user) {
     session_destroy();
@@ -53,21 +57,20 @@ if (!$current_user) {
 
 $total_unread = 0;
 
-$unread_stmt = $conn->prepare("
+$unread_stmt = $supabase->prepare("
     SELECT COUNT(*) AS total_unread
     FROM messages
-    WHERE receiver_id = ?
-    AND is_read = 0
+    WHERE receiver_id = :user_id
+    AND is_read = FALSE
 ");
 
-if ($unread_stmt) {
-    $unread_stmt->bind_param("i", $user_id);
-    $unread_stmt->execute();
+$unread_stmt->execute([
+    ":user_id" => $user_id
+]);
 
-    $unread_data = $unread_stmt->get_result()->fetch_assoc();
+$unread_data = $unread_stmt->fetch(PDO::FETCH_ASSOC);
 
-    $total_unread = (int) ($unread_data["total_unread"] ?? 0);
-}
+$total_unread = (int) ($unread_data["total_unread"] ?? 0);
 
 /* =========================================================
    GET USER'S CLAIMS
@@ -87,20 +90,24 @@ $claims_sql = "
         items.location,
         items.description
     FROM claims
-    JOIN items ON claims.item_id = items.id
-    WHERE claims.user_id = ?
+    INNER JOIN items ON claims.item_id = items.id
+    WHERE claims.user_id = :user_id
     ORDER BY claims.created_at DESC
 ";
 
-$claims_stmt = $conn->prepare($claims_sql);
-$claims_stmt->bind_param("i", $user_id);
-$claims_stmt->execute();
+$claims_stmt = $supabase->prepare($claims_sql);
 
-$claims_result = $claims_stmt->get_result();
-$total_claims = $claims_result->num_rows;
+$claims_stmt->execute([
+    ":user_id" => $user_id
+]);
+
+$claims_result = $claims_stmt->fetchAll(PDO::FETCH_ASSOC);
+
+$total_claims = count($claims_result);
 
 /* =========================================================
    GET USER'S REPORTED ITEMS
+   INCLUDING VERIFICATION CODE
 ========================================================= */
 
 $sql = "
@@ -114,18 +121,22 @@ $sql = "
         date_reported,
         image,
         status,
+        verification_code,
         created_at
     FROM items
-    WHERE user_id = ?
+    WHERE user_id = :user_id
     ORDER BY created_at DESC
 ";
 
-$stmt = $conn->prepare($sql);
-$stmt->bind_param("i", $user_id);
-$stmt->execute();
+$stmt = $supabase->prepare($sql);
 
-$result = $stmt->get_result();
-$total_reports = $result->num_rows;
+$stmt->execute([
+    ":user_id" => $user_id
+]);
+
+$result = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+$total_reports = count($result);
 
 /* =========================================================
    GET AI MATCH RESULTS
@@ -152,23 +163,24 @@ if (
     $source_item_id = (int) ($ai_results["item_id"] ?? 0);
     $source_type = strtolower(trim((string) ($ai_results["item_type"] ?? "")));
 
-    $source_stmt = $conn->prepare("
-        SELECT id, user_id, item_type, status
-        FROM items
-        WHERE id = ? AND user_id = ?
-        LIMIT 1
-    ");
-
     $source_valid = false;
 
-    if ($source_stmt && $source_item_id > 0) {
+    if ($source_item_id > 0) {
 
-        $source_stmt->bind_param("ii", $source_item_id, $user_id);
-        $source_stmt->execute();
+        $source_stmt = $supabase->prepare("
+            SELECT id, user_id, item_type, status
+            FROM items
+            WHERE id = :item_id
+              AND user_id = :user_id
+            LIMIT 1
+        ");
 
-        $source = $source_stmt->get_result()->fetch_assoc();
+        $source_stmt->execute([
+            ":item_id" => $source_item_id,
+            ":user_id" => $user_id
+        ]);
 
-        $source_stmt->close();
+        $source = $source_stmt->fetch(PDO::FETCH_ASSOC);
 
         if ($source) {
 
@@ -183,7 +195,7 @@ if (
 
     if ($source_valid && in_array($source_type, ["lost", "found"], true)) {
 
-        $check_match_stmt = $conn->prepare("
+        $check_match_stmt = $supabase->prepare("
             SELECT
                 l.id AS lost_item_id,
                 l.user_id AS lost_user_id,
@@ -192,6 +204,7 @@ if (
                 l.location AS lost_location,
                 l.image AS lost_image,
                 l.status AS lost_status,
+
                 f.id AS found_item_id,
                 f.user_id AS found_user_id,
                 f.item_name AS found_name,
@@ -199,92 +212,93 @@ if (
                 f.location AS found_location,
                 f.image AS found_image,
                 f.status AS found_status
+
             FROM items AS l
-            INNER JOIN items AS f ON f.id = ?
-            WHERE l.id = ?
+            INNER JOIN items AS f
+                ON f.id = :found_item_id
+
+            WHERE l.id = :lost_item_id
               AND l.item_type = 'lost'
               AND f.item_type = 'found'
               AND l.user_id <> f.user_id
               AND l.status = 'lost'
               AND f.status IN ('found', 'claim_pending')
+
             LIMIT 1
         ");
 
-        if ($check_match_stmt) {
+        foreach ($ai_results["matches"] as $match) {
 
-            foreach ($ai_results["matches"] as $match) {
+            $lost_item_id = (int) ($match["lost_item_id"] ?? 0);
+            $found_item_id = (int) ($match["found_item_id"] ?? 0);
 
-                $lost_item_id = (int) ($match["lost_item_id"] ?? 0);
-                $found_item_id = (int) ($match["found_item_id"] ?? 0);
-
-                if ($lost_item_id <= 0 || $found_item_id <= 0) {
-                    continue;
-                }
-
-                if (
-                    ($source_type === "lost" && $lost_item_id !== $source_item_id) ||
-                    ($source_type === "found" && $found_item_id !== $source_item_id)
-                ) {
-                    continue;
-                }
-
-                $check_match_stmt->bind_param("ii", $found_item_id, $lost_item_id);
-                $check_match_stmt->execute();
-
-                $db_match = $check_match_stmt->get_result()->fetch_assoc();
-
-                if (!$db_match) {
-                    continue;
-                }
-
-                if (
-                    ($source_type === "lost" && (int) $db_match["lost_user_id"] !== $user_id) ||
-                    ($source_type === "found" && (int) $db_match["found_user_id"] !== $user_id) ||
-                    ($source_type === "lost" && (int) $db_match["found_user_id"] === $user_id) ||
-                    ($source_type === "found" && (int) $db_match["lost_user_id"] === $user_id)
-                ) {
-                    continue;
-                }
-
-                if ($source_type === "lost") {
-
-                    $candidate_type = "found";
-                    $candidate_name = $db_match["found_name"];
-                    $candidate_description = $db_match["found_description"];
-                    $candidate_location = $db_match["found_location"];
-                    $candidate_image = $db_match["found_image"];
-                    $candidate_user_id = (int) $db_match["found_user_id"];
-                    $candidate_item_id = (int) $db_match["found_item_id"];
-
-                } else {
-
-                    $candidate_type = "lost";
-                    $candidate_name = $db_match["lost_name"];
-                    $candidate_description = $db_match["lost_description"];
-                    $candidate_location = $db_match["lost_location"];
-                    $candidate_image = $db_match["lost_image"];
-                    $candidate_user_id = (int) $db_match["lost_user_id"];
-                    $candidate_item_id = (int) $db_match["lost_item_id"];
-                }
-
-                $valid_matches[] = [
-                    "item_type" => $candidate_type,
-                    "item_name" => $candidate_name,
-                    "description" => $candidate_description,
-                    "location" => $candidate_location,
-                    "image" => $candidate_image,
-                    "similarity_score" => (float) ($match["similarity_score"] ?? $match["score"] ?? 0),
-                    "lost_item_id" => (int) $db_match["lost_item_id"],
-                    "found_item_id" => (int) $db_match["found_item_id"],
-                    "lost_user_id" => (int) $db_match["lost_user_id"],
-                    "found_user_id" => (int) $db_match["found_user_id"],
-                    "candidate_user_id" => $candidate_user_id,
-                    "candidate_item_id" => $candidate_item_id,
-                    "message_finder_url" => "messages.php?user=" . $candidate_user_id . "&item=" . $candidate_item_id
-                ];
+            if ($lost_item_id <= 0 || $found_item_id <= 0) {
+                continue;
             }
 
-            $check_match_stmt->close();
+            if (
+                ($source_type === "lost" && $lost_item_id !== $source_item_id) ||
+                ($source_type === "found" && $found_item_id !== $source_item_id)
+            ) {
+                continue;
+            }
+
+            $check_match_stmt->execute([
+                ":found_item_id" => $found_item_id,
+                ":lost_item_id" => $lost_item_id
+            ]);
+
+            $db_match = $check_match_stmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$db_match) {
+                continue;
+            }
+
+            if (
+                ($source_type === "lost" && (int) $db_match["lost_user_id"] !== $user_id) ||
+                ($source_type === "found" && (int) $db_match["found_user_id"] !== $user_id) ||
+                ($source_type === "lost" && (int) $db_match["found_user_id"] === $user_id) ||
+                ($source_type === "found" && (int) $db_match["lost_user_id"] === $user_id)
+            ) {
+                continue;
+            }
+
+            if ($source_type === "lost") {
+
+                $candidate_type = "found";
+                $candidate_name = $db_match["found_name"];
+                $candidate_description = $db_match["found_description"];
+                $candidate_location = $db_match["found_location"];
+                $candidate_image = $db_match["found_image"];
+                $candidate_user_id = (int) $db_match["found_user_id"];
+                $candidate_item_id = (int) $db_match["found_item_id"];
+
+            } else {
+
+                $candidate_type = "lost";
+                $candidate_name = $db_match["lost_name"];
+                $candidate_description = $db_match["lost_description"];
+                $candidate_location = $db_match["lost_location"];
+                $candidate_image = $db_match["lost_image"];
+                $candidate_user_id = (int) $db_match["lost_user_id"];
+                $candidate_item_id = (int) $db_match["lost_item_id"];
+            }
+
+            $valid_matches[] = [
+                "item_type" => $candidate_type,
+                "item_name" => $candidate_name,
+                "description" => $candidate_description,
+                "location" => $candidate_location,
+                "image" => $candidate_image,
+                "similarity_score" => (float) ($match["similarity_score"] ?? $match["score"] ?? 0),
+                "lost_item_id" => (int) $db_match["lost_item_id"],
+                "found_item_id" => (int) $db_match["found_item_id"],
+                "lost_user_id" => (int) $db_match["lost_user_id"],
+                "found_user_id" => (int) $db_match["found_user_id"],
+                "candidate_user_id" => $candidate_user_id,
+                "candidate_item_id" => $candidate_item_id,
+                "message_finder_url" => "messages.php?user=" . $candidate_user_id . "&item=" . $candidate_item_id
+            ];
         }
     }
 
@@ -909,6 +923,79 @@ body {
     border: 1px solid #e5c957;
 }
 
+/* =========================================================
+   VERIFICATION CODE
+========================================================= */
+
+.verification-box {
+    margin: 14px 0;
+    padding: 13px;
+    background: #f7faff;
+    border: 1px solid #cbd9eb;
+    border-left: 4px solid #d4af37;
+    border-radius: 8px;
+}
+
+.verification-label {
+    display: block;
+    color: #64748b;
+    font-size: 11px;
+    font-weight: bold;
+    text-transform: uppercase;
+    margin-bottom: 7px;
+}
+
+.verification-code-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.verification-code {
+    color: #0f2f5f;
+    font-size: 13px;
+    font-weight: bold;
+    letter-spacing: .5px;
+    overflow-wrap: anywhere;
+}
+
+.copy-code-button {
+    flex-shrink: 0;
+    border: 1px solid #cbd5e1;
+    background: white;
+    color: #164a8a;
+    padding: 7px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: bold;
+    font-family: inherit;
+    transition: .2s ease;
+}
+
+.copy-code-button:hover {
+    background: #eaf1fa;
+}
+
+.verification-note {
+    margin: 8px 0 0;
+    color: #64748b;
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.verification-missing {
+    margin: 14px 0;
+    padding: 11px;
+    background: #fff8dc;
+    border: 1px solid #e5c957;
+    border-radius: 8px;
+    color: #8a6814;
+    font-size: 11px;
+    line-height: 1.5;
+}
+
 .details {
     font-size: 13px;
     line-height: 1.7;
@@ -1017,10 +1104,12 @@ body {
 
 .ai-match-card img {
     width: 100%;
-    height: 190px;
-    object-fit: cover;
+    height: auto;
+    max-height: 450px;
+    object-fit: contain;
+    object-position: center;
     display: block;
-    background: #e8eef6;
+    background: #f1f5f9;
 }
 
 .ai-match-content {
@@ -1066,7 +1155,7 @@ body {
 }
 
 /* =========================================================
-   98%+ HIGH SIMILARITY HIGHLIGHT
+   HIGH SIMILARITY HIGHLIGHT
 ========================================================= */
 
 .ai-match-card.high-match {
@@ -1224,12 +1313,22 @@ body {
     .claim-content {
         padding: 16px;
     }
+
+    .verification-code-row {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .copy-code-button {
+        width: 100%;
+    }
 }
 
 @media print {
 
     .navbar,
-    .ai-match-form {
+    .ai-match-form,
+    .copy-code-button {
         display: none;
     }
 
@@ -1583,11 +1682,11 @@ body {
 
         </div>
 
-        <?php if ($claims_result && $claims_result->num_rows > 0): ?>
+        <?php if (!empty($claims_result)): ?>
 
             <div class="claims-container">
 
-                <?php while ($claim = $claims_result->fetch_assoc()): ?>
+                <?php foreach ($claims_result as $claim): ?>
 
                     <div class="claim-card">
 
@@ -1676,7 +1775,7 @@ body {
 
                     </div>
 
-                <?php endwhile; ?>
+                <?php endforeach; ?>
 
             </div>
 
@@ -1708,11 +1807,11 @@ body {
 
         </div>
 
-        <?php if ($result && $result->num_rows > 0): ?>
+        <?php if (!empty($result)): ?>
 
             <div class="items">
 
-                <?php while ($item = $result->fetch_assoc()): ?>
+                <?php foreach ($result as $item): ?>
 
                     <div class="card">
 
@@ -1778,6 +1877,46 @@ body {
                                 </span>
 
                             </div>
+
+                            <!-- VERIFICATION CODE -->
+
+                            <?php if (!empty($item["verification_code"])): ?>
+
+                                <div class="verification-box">
+
+                                    <span class="verification-label">
+                                        Report Verification Code
+                                    </span>
+
+                                    <div class="verification-code-row">
+
+                                        <span class="verification-code">
+                                            <?php echo e($item["verification_code"]); ?>
+                                        </span>
+
+                                        <button
+                                            type="button"
+                                            class="copy-code-button"
+                                            onclick="copyVerificationCode(this, '<?php echo e($item["verification_code"]); ?>')"
+                                        >
+                                            Copy Code
+                                        </button>
+
+                                    </div>
+
+                                    <p class="verification-note">
+                                        Keep this code and provide it to the administrator when requesting verification of this report. This code identifies your report but does not replace identity or ownership verification.
+                                    </p>
+
+                                </div>
+
+                            <?php else: ?>
+
+                                <div class="verification-missing">
+                                    No verification code is available for this report. This may be an older report submitted before the verification-code feature was added.
+                                </div>
+
+                            <?php endif; ?>
 
                             <div class="details">
 
@@ -1864,7 +2003,7 @@ body {
 
                     </div>
 
-                <?php endwhile; ?>
+                <?php endforeach; ?>
 
             </div>
 
@@ -1936,6 +2075,67 @@ if (profileButton && profileDropdown) {
         }
 
     });
+
+}
+
+/* COPY VERIFICATION CODE */
+
+function copyVerificationCode(button, code) {
+
+    if (navigator.clipboard && window.isSecureContext) {
+
+        navigator.clipboard.writeText(code)
+            .then(function() {
+                button.textContent = "Copied!";
+                setTimeout(function() {
+                    button.textContent = "Copy Code";
+                }, 1800);
+            })
+            .catch(function() {
+                fallbackCopyCode(button, code);
+            });
+
+    } else {
+
+        fallbackCopyCode(button, code);
+
+    }
+
+}
+
+function fallbackCopyCode(button, code) {
+
+    const textArea = document.createElement("textarea");
+
+    textArea.value = code;
+    textArea.style.position = "fixed";
+    textArea.style.opacity = "0";
+
+    document.body.appendChild(textArea);
+
+    textArea.select();
+
+    try {
+
+        const successful = document.execCommand("copy");
+
+        if (successful) {
+            button.textContent = "Copied!";
+        } else {
+            button.textContent = "Copy Failed";
+        }
+
+    } catch (error) {
+
+        button.textContent = "Copy Failed";
+
+    }
+
+    document.body.removeChild(textArea);
+
+    setTimeout(function() {
+        button.textContent = "Copy Code";
+    }, 1800);
 
 }
 

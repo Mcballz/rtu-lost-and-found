@@ -3,17 +3,35 @@
 
 session_start();
 
+/* =========================================================
+   PREVENT BROWSER CACHING
+========================================================= */
+
 header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+header("Cache-Control: post-check=0, pre-check=0", false);
 header("Pragma: no-cache");
+header("Expires: 0");
+
+/* =========================================================
+   CHECK LOGIN
+========================================================= */
 
 if (!isset($_SESSION["user_id"])) {
     header("Location: login.php");
     exit();
 }
 
-require_once "config/database.php";
+/* =========================================================
+   SUPABASE CONNECTION
+========================================================= */
+
+require_once __DIR__ . "/config/supabase.php";
 
 $user_id = (int) $_SESSION["user_id"];
+
+/* =========================================================
+   RETURN TO REPORTS
+========================================================= */
 
 function returnToReports($item_id, $message = "")
 {
@@ -24,6 +42,10 @@ function returnToReports($item_id, $message = "")
     header("Location: my_reports.php?matches_for=" . (int) $item_id);
     exit();
 }
+
+/* =========================================================
+   CHECK REQUEST METHOD
+========================================================= */
 
 if ($_SERVER["REQUEST_METHOD"] !== "POST") {
     header("Location: my_reports.php");
@@ -37,11 +59,9 @@ if (!$item_id || $item_id <= 0) {
     exit();
 }
 
-/*
-|--------------------------------------------------------------------------
-| CONFIGURATION
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   CONFIGURATION
+========================================================= */
 
 $threshold = 70.00;
 
@@ -49,29 +69,42 @@ $matches = [];
 $errors = 0;
 $already_existing = 0;
 
-/*
-|--------------------------------------------------------------------------
-| VERIFY SELECTED REPORT
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   VERIFY SELECTED REPORT
+========================================================= */
 
-$item_stmt = $conn->prepare("
-    SELECT id, user_id, item_type, item_name, category,
-           description, location, image, status
-    FROM items
-    WHERE id = ? AND user_id = ?
-    LIMIT 1
-");
+try {
 
-if (!$item_stmt) {
+    $item_stmt = $supabase->prepare("
+        SELECT
+            id,
+            user_id,
+            item_type,
+            item_name,
+            category,
+            description,
+            location,
+            image,
+            status
+        FROM items
+        WHERE id = :item_id
+          AND user_id = :user_id
+        LIMIT 1
+    ");
+
+    $item_stmt->execute([
+        ":item_id" => $item_id,
+        ":user_id" => $user_id
+    ]);
+
+    $item = $item_stmt->fetch(PDO::FETCH_ASSOC);
+
+} catch (PDOException $e) {
+
+    error_log("AI Match - Report retrieval error: " . $e->getMessage());
+
     returnToReports($item_id, "Could not retrieve your report.");
 }
-
-$item_stmt->bind_param("ii", $item_id, $user_id);
-$item_stmt->execute();
-
-$item = $item_stmt->get_result()->fetch_assoc();
-$item_stmt->close();
 
 if (!$item) {
     returnToReports(
@@ -101,11 +134,9 @@ if (empty($item["image"])) {
     );
 }
 
-/*
-|--------------------------------------------------------------------------
-| SELECTED REPORT IMAGE
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   SELECTED REPORT IMAGE
+========================================================= */
 
 $selected_folder = ($item_type === "lost")
     ? "uploads/lost/"
@@ -124,11 +155,9 @@ if (!is_file($selected_image_path)) {
     );
 }
 
-/*
-|--------------------------------------------------------------------------
-| PYTHON CONFIGURATION
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   PYTHON CONFIGURATION
+========================================================= */
 
 $python = __DIR__ . DIRECTORY_SEPARATOR .
     "ai" . DIRECTORY_SEPARATOR .
@@ -161,70 +190,85 @@ if (!function_exists("shell_exec")) {
     );
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET REPORTS OF THE OPPOSITE TYPE
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   GET REPORTS OF THE OPPOSITE TYPE
+========================================================= */
 
 if ($item_type === "lost") {
 
     $candidate_type = "found";
 
-    $candidate_stmt = $conn->prepare("
-        SELECT id, user_id, item_name, category,
-               description, location, image, status
+    $candidate_sql = "
+        SELECT
+            id,
+            user_id,
+            item_name,
+            category,
+            description,
+            location,
+            image,
+            status
         FROM items
         WHERE item_type = 'found'
           AND image IS NOT NULL
-          AND image != ''
+          AND image <> ''
           AND status IN ('found', 'claim_pending')
-          AND user_id != ?
-          AND id != ?
+          AND user_id <> :user_id
+          AND id <> :item_id
         ORDER BY created_at DESC
-    ");
+    ";
 
 } else {
 
     $candidate_type = "lost";
 
-    $candidate_stmt = $conn->prepare("
-        SELECT id, user_id, item_name, category,
-               description, location, image, status
+    $candidate_sql = "
+        SELECT
+            id,
+            user_id,
+            item_name,
+            category,
+            description,
+            location,
+            image,
+            status
         FROM items
         WHERE item_type = 'lost'
           AND image IS NOT NULL
-          AND image != ''
+          AND image <> ''
           AND status = 'lost'
-          AND user_id != ?
-          AND id != ?
+          AND user_id <> :user_id
+          AND id <> :item_id
         ORDER BY created_at DESC
-    ");
+    ";
 }
 
-if (!$candidate_stmt) {
+try {
+
+    $candidate_stmt = $supabase->prepare($candidate_sql);
+
+    $candidate_stmt->execute([
+        ":user_id" => $user_id,
+        ":item_id" => $item_id
+    ]);
+
+    $candidates = $candidate_stmt->fetchAll(PDO::FETCH_ASSOC);
+
+} catch (PDOException $e) {
+
+    error_log("AI Match - Candidate retrieval error: " . $e->getMessage());
+
     returnToReports(
         $item_id,
         "Could not retrieve reports for matching."
     );
 }
 
-$candidate_stmt->bind_param("ii", $user_id, $item_id);
-$candidate_stmt->execute();
-
-$candidates = $candidate_stmt
-    ->get_result()
-    ->fetch_all(MYSQLI_ASSOC);
-
-$candidate_stmt->close();
-
 $candidate_count = count($candidates);
 
-/*
-|--------------------------------------------------------------------------
-| STOP IF THERE ARE NO CANDIDATES
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   STOP IF THERE ARE NO CANDIDATES
+========================================================= */
 
 if ($candidate_count === 0) {
 
@@ -246,11 +290,9 @@ if ($candidate_count === 0) {
     exit();
 }
 
-/*
-|--------------------------------------------------------------------------
-| PREPARE HYBRID AI INPUT
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   PREPARE HYBRID AI INPUT
+========================================================= */
 
 $source_data = [
     "id" => (int) $item["id"],
@@ -305,11 +347,9 @@ if (empty($hybrid_candidates)) {
     );
 }
 
-/*
-|--------------------------------------------------------------------------
-| PREPARE TEMPORARY JSON INPUT
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   PREPARE TEMPORARY JSON INPUT
+========================================================= */
 
 $input_data = [
     "source" => $source_data,
@@ -338,6 +378,7 @@ if ($temp_file === false) {
 }
 
 if (file_put_contents($temp_file, $json_input) === false) {
+
     @unlink($temp_file);
 
     returnToReports(
@@ -346,17 +387,9 @@ if (file_put_contents($temp_file, $json_input) === false) {
     );
 }
 
-/*
-|--------------------------------------------------------------------------
-| RUN PYTHON HYBRID AI DIRECTLY
-|--------------------------------------------------------------------------
-|
-| Python loads DINOv2 and CLIP, performs matching,
-| outputs JSON, and then exits.
-|
-| No Flask server is required.
-|
-*/
+/* =========================================================
+   RUN PYTHON HYBRID AI
+========================================================= */
 
 set_time_limit(0);
 ini_set("max_execution_time", "0");
@@ -369,11 +402,9 @@ $command =
 
 $ai_output = shell_exec($command);
 
-/*
-|--------------------------------------------------------------------------
-| REMOVE TEMPORARY INPUT FILE
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   REMOVE TEMPORARY INPUT FILE
+========================================================= */
 
 @unlink($temp_file);
 
@@ -387,15 +418,9 @@ if ($ai_output === null || trim($ai_output) === "") {
     );
 }
 
-/*
-|--------------------------------------------------------------------------
-| EXTRACT JSON RESPONSE
-|--------------------------------------------------------------------------
-|
-| Python may print model-loading messages before its JSON response.
-| Extract the final JSON object rather than decoding those messages.
-|
-*/
+/* =========================================================
+   EXTRACT JSON RESPONSE
+========================================================= */
 
 $ai_output = trim($ai_output);
 
@@ -437,11 +462,9 @@ if (
     );
 }
 
-/*
-|--------------------------------------------------------------------------
-| PROCESS HYBRID AI RESULTS
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   PROCESS HYBRID AI RESULTS
+========================================================= */
 
 foreach ($ai_response["results"] as $ai_result) {
 
@@ -478,11 +501,9 @@ foreach ($ai_response["results"] as $ai_result) {
         continue;
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | IDENTIFY LOST AND FOUND REPORTS
-    |--------------------------------------------------------------------------
-    */
+    /* =====================================================
+       IDENTIFY LOST AND FOUND REPORTS
+    ===================================================== */
 
     if ($item_type === "lost") {
 
@@ -525,33 +546,34 @@ foreach ($ai_response["results"] as $ai_result) {
         $found_image = $item["image"];
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | CHECK EXISTING MATCH
-    |--------------------------------------------------------------------------
-    */
+    /* =====================================================
+       CHECK EXISTING MATCH
+    ===================================================== */
 
-    $duplicate_stmt = $conn->prepare("
-        SELECT id
-        FROM ai_matches
-        WHERE lost_item_id = ?
-          AND found_item_id = ?
-        LIMIT 1
-    ");
+    try {
 
-    if (!$duplicate_stmt) {
+        $duplicate_stmt = $supabase->prepare("
+            SELECT id
+            FROM ai_matches
+            WHERE lost_item_id = :lost_id
+              AND found_item_id = :found_id
+            LIMIT 1
+        ");
+
+        $duplicate_stmt->execute([
+            ":lost_id" => $lost_id,
+            ":found_id" => $found_id
+        ]);
+
+        $existing_match = $duplicate_stmt->fetch(PDO::FETCH_ASSOC);
+
+    } catch (PDOException $e) {
+
+        error_log("AI Match - Duplicate check error: " . $e->getMessage());
+
         $errors++;
         continue;
     }
-
-    $duplicate_stmt->bind_param("ii", $lost_id, $found_id);
-    $duplicate_stmt->execute();
-
-    $existing_match = $duplicate_stmt
-        ->get_result()
-        ->fetch_assoc();
-
-    $duplicate_stmt->close();
 
     if ($existing_match) {
 
@@ -560,45 +582,45 @@ foreach ($ai_response["results"] as $ai_result) {
 
     } else {
 
-        /*
-        |--------------------------------------------------------------------------
-        | SAVE NEW MATCH
-        |--------------------------------------------------------------------------
-        */
+        /* =================================================
+           SAVE NEW MATCH
+        ================================================= */
 
-        $match_stmt = $conn->prepare("
-            INSERT INTO ai_matches
-            (lost_item_id, found_item_id, similarity_score)
-            VALUES (?, ?, ?)
-        ");
+        try {
 
-        if (!$match_stmt) {
+            $match_stmt = $supabase->prepare("
+                INSERT INTO ai_matches
+                    (lost_item_id, found_item_id, similarity_score)
+                VALUES
+                    (:lost_id, :found_id, :score)
+                RETURNING id
+            ");
+
+            $match_stmt->execute([
+                ":lost_id" => $lost_id,
+                ":found_id" => $found_id,
+                ":score" => $similarity_score
+            ]);
+
+            $match_id = (int) $match_stmt->fetchColumn();
+
+            if ($match_id <= 0) {
+                $errors++;
+                continue;
+            }
+
+        } catch (PDOException $e) {
+
+            error_log("AI Match - Insert error: " . $e->getMessage());
+
             $errors++;
             continue;
         }
-
-        $match_stmt->bind_param(
-            "iid",
-            $lost_id,
-            $found_id,
-            $similarity_score
-        );
-
-        if (!$match_stmt->execute()) {
-            $errors++;
-            $match_stmt->close();
-            continue;
-        }
-
-        $match_id = (int) $conn->insert_id;
-        $match_stmt->close();
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | PREPARE MESSAGE FINDER URL
-    |--------------------------------------------------------------------------
-    */
+    /* =====================================================
+       PREPARE MESSAGE FINDER URL
+    ===================================================== */
 
     $message_finder_url = "";
 
@@ -609,18 +631,18 @@ foreach ($ai_response["results"] as $ai_result) {
             "&item=" . $found_id;
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | PREPARE RESULT
-    |--------------------------------------------------------------------------
-    */
+    /* =====================================================
+       PREPARE RESULT
+    ===================================================== */
 
     $components = $ai_result["components"] ?? [];
 
     $matches[] = [
         "match_id" => $match_id,
+
         "lost_item_id" => $lost_id,
         "found_item_id" => $found_id,
+
         "lost_user_id" => $lost_user_id,
         "found_user_id" => $found_user_id,
 
@@ -647,11 +669,9 @@ foreach ($ai_response["results"] as $ai_result) {
     ];
 }
 
-/*
-|--------------------------------------------------------------------------
-| SAVE RESULTS FOR MY REPORTS PAGE
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   SAVE RESULTS FOR MY REPORTS PAGE
+========================================================= */
 
 $_SESSION["ai_match_results"] = [
     "item_id" => $item_id,
@@ -670,3 +690,4 @@ unset($_SESSION["ai_match_error"]);
 header("Location: my_reports.php?matches_for=" . $item_id);
 exit();
 
+?>

@@ -1,18 +1,23 @@
+
 <?php
 
 session_start();
 
-require_once "config/database.php";
+require_once __DIR__ . "/config/supabase.php";
 
 $message = "";
 $message_type = "";
 
-if ($_SERVER["REQUEST_METHOD"] == "POST") {
+/* =========================================================
+   REGISTRATION PROCESS - SUPABASE PDO
+========================================================= */
 
-    $student_id = trim($_POST["student_id"]);
-    $name = trim($_POST["name"]);
-    $email = trim($_POST["email"]);
-    $password = $_POST["password"];
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
+
+    $student_id = trim($_POST["student_id"] ?? "");
+    $name = trim($_POST["name"] ?? "");
+    $email = trim($_POST["email"] ?? "");
+    $password = $_POST["password"] ?? "";
 
     if (
         empty($student_id) ||
@@ -24,78 +29,103 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         $message = "Please fill in all fields.";
         $message_type = "error";
 
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+
+        $message = "Please enter a valid email address.";
+        $message_type = "error";
+
     } else {
 
-        $check_sql = "
-            SELECT id
-            FROM users
-            WHERE student_id = ?
-            OR email = ?
-        ";
+        try {
 
-        $check_stmt = $conn->prepare($check_sql);
+            /* CHECK IF STUDENT ID OR EMAIL ALREADY EXISTS */
 
-        $check_stmt->bind_param(
-            "ss",
-            $student_id,
-            $email
-        );
-
-        $check_stmt->execute();
-
-        $check_result = $check_stmt->get_result();
-
-        if ($check_result->num_rows > 0) {
-
-            $message = "Student ID or email already exists.";
-            $message_type = "error";
-
-        } else {
-
-            $hashed_password = password_hash(
-                $password,
-                PASSWORD_DEFAULT
-            );
-
-            $sql = "
-                INSERT INTO users
-                (student_id, name, email, password, role)
-                VALUES (?, ?, ?, ?, 'student')
+            $check_sql = "
+                SELECT id
+                FROM users
+                WHERE student_id = :student_id
+                   OR email = :email
+                LIMIT 1
             ";
 
-            $stmt = $conn->prepare($sql);
+            $check_stmt = $supabase->prepare($check_sql);
 
-            $stmt->bind_param(
-                "ssss",
-                $student_id,
-                $name,
-                $email,
-                $hashed_password
-            );
+            $check_stmt->execute([
+                "student_id" => $student_id,
+                "email" => $email
+            ]);
 
-            if ($stmt->execute()) {
+            $existing_user = $check_stmt->fetch(PDO::FETCH_ASSOC);
+
+            if ($existing_user) {
+
+                $message = "Student ID or email already exists.";
+                $message_type = "error";
+
+            } else {
+
+                /* HASH PASSWORD */
+
+                $hashed_password = password_hash(
+                    $password,
+                    PASSWORD_DEFAULT
+                );
+
+                /* INSERT NEW USER */
+
+                $sql = "
+                    INSERT INTO users
+                    (student_id, name, email, password, role)
+                    VALUES
+                    (:student_id, :name, :email, :password, 'student')
+                ";
+
+                $stmt = $supabase->prepare($sql);
+
+                $stmt->execute([
+                    "student_id" => $student_id,
+                    "name" => $name,
+                    "email" => $email,
+                    "password" => $hashed_password
+                ]);
 
                 $message = "Registration successful! You can now login.";
                 $message_type = "success";
 
-            } else {
+                /* CLEAR FORM VALUES AFTER SUCCESS */
 
-                $message = "Registration failed. Please try again.";
-                $message_type = "error";
+                $_POST = [];
 
             }
 
-            $stmt->close();
+        } catch (PDOException $e) {
+
+            error_log("Registration error: " . $e->getMessage());
+
+            $message = "Registration failed. Please try again.";
+            $message_type = "error";
+
         }
 
-        $check_stmt->close();
     }
+
+}
+
+/* =========================================================
+   HTML ESCAPE HELPER
+========================================================= */
+
+function e($value) {
+    return htmlspecialchars(
+        (string)($value ?? ""),
+        ENT_QUOTES,
+        "UTF-8"
+    );
 }
 
 ?>
 
 <!DOCTYPE html>
-
 <html lang="en">
 
 <head>
@@ -107,9 +137,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     content="width=device-width, initial-scale=1.0"
 >
 
-<title>
-    Register - RTU Lost and Found
-</title>
+<title>Register - RTU Lost and Found</title>
 
 <style>
 
@@ -124,17 +152,12 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 }
 
 body {
-
     min-height: 100vh;
 
     font-family:
         Arial,
         Helvetica,
         sans-serif;
-
-    /*
-       RTU BLUE + GOLD BACKGROUND
-    */
 
     background:
         radial-gradient(
@@ -157,95 +180,75 @@ body {
     color: #1f2937;
 
     display: flex;
-
     align-items: center;
-
     justify-content: center;
 
     padding: 25px;
 
     position: relative;
-
     overflow: hidden;
 }
-
 
 /* =========================================================
    BACKGROUND GOLD DECORATION
 ========================================================= */
 
 body::before {
-
     content: "";
 
     position: fixed;
 
     width: 420px;
-
     height: 420px;
 
     border-radius: 50%;
 
-    background:
-        rgba(212, 175, 55, 0.12);
+    background: rgba(212, 175, 55, 0.12);
 
     top: -180px;
-
     right: -120px;
 
     pointer-events: none;
 }
 
-
 body::after {
-
     content: "";
 
     position: fixed;
 
     width: 350px;
-
     height: 350px;
 
     border-radius: 50%;
 
-    background:
-        rgba(212, 175, 55, 0.10);
+    background: rgba(212, 175, 55, 0.10);
 
     bottom: -170px;
-
     left: -120px;
 
     pointer-events: none;
 }
-
 
 /* =========================================================
    REGISTER WRAPPER
 ========================================================= */
 
 .register-wrapper {
-
     width: 100%;
-
     max-width: 470px;
 
     position: relative;
-
     z-index: 2;
 }
-
 
 /* =========================================================
    REGISTER CARD
 ========================================================= */
 
 .register-card {
-
     background: white;
 
     border-radius: 18px;
-
     overflow: hidden;
 
     box-shadow:
@@ -259,13 +262,11 @@ body::after {
     position: relative;
 }
 
-
 /* =========================================================
    TOP BLUE HEADER
 ========================================================= */
 
 .register-header {
-
     background:
         linear-gradient(
             135deg,
@@ -280,62 +281,48 @@ body::after {
 
     text-align: center;
 
-    border-bottom:
-        5px solid #d4af37;
+    border-bottom: 5px solid #d4af37;
 
     position: relative;
 }
 
-
-/* subtle gold highlight */
-
 .register-header::after {
-
     content: "";
 
     position: absolute;
 
     width: 110px;
-
     height: 110px;
 
     border-radius: 50%;
 
-    background:
-        rgba(212, 175, 55, 0.10);
+    background: rgba(212, 175, 55, 0.10);
 
     top: -60px;
-
     right: -35px;
 
     pointer-events: none;
 }
-
 
 /* =========================================================
    LOGO
 ========================================================= */
 
 .logo-container {
-
     width: 82px;
-
     height: 82px;
 
     margin: 0 auto 15px;
 
     display: flex;
-
     align-items: center;
-
     justify-content: center;
 
     background: white;
 
     border-radius: 50%;
 
-    border:
-        3px solid #d4af37;
+    border: 3px solid #d4af37;
 
     box-shadow:
         0 5px 18px
@@ -344,43 +331,32 @@ body::after {
     overflow: hidden;
 
     position: relative;
-
     z-index: 2;
 }
 
-
 .logo-container img {
-
     width: 65px;
-
     height: 65px;
 
     object-fit: contain;
-
     display: block;
 }
-
 
 /* =========================================================
    HEADER TEXT
 ========================================================= */
 
 .register-header h1 {
-
     font-size: 27px;
-
     margin-bottom: 7px;
 
     color: white;
 
     position: relative;
-
     z-index: 2;
 }
 
-
 .register-header p {
-
     font-size: 14px;
 
     color: #e5e7eb;
@@ -388,17 +364,14 @@ body::after {
     line-height: 1.5;
 
     position: relative;
-
     z-index: 2;
 }
-
 
 /* =========================================================
    FORM AREA
 ========================================================= */
 
 .register-body {
-
     padding: 30px;
 
     background:
@@ -409,13 +382,11 @@ body::after {
         );
 }
 
-
 /* =========================================================
    MESSAGE
 ========================================================= */
 
 .message {
-
     padding: 12px 14px;
 
     border-radius: 9px;
@@ -423,47 +394,34 @@ body::after {
     margin-bottom: 20px;
 
     font-size: 13px;
-
     line-height: 1.5;
 
     text-align: center;
 }
 
-
 .message.success {
-
     background: #ecfdf5;
-
     color: #047857;
 
-    border:
-        1px solid #a7f3d0;
+    border: 1px solid #a7f3d0;
 }
-
 
 .message.error {
-
     background: #fef2f2;
-
     color: #b91c1c;
 
-    border:
-        1px solid #fecaca;
+    border: 1px solid #fecaca;
 }
-
 
 /* =========================================================
    FORM GROUP
 ========================================================= */
 
 .form-group {
-
     margin-bottom: 18px;
 }
 
-
 .form-group label {
-
     display: block;
 
     margin-bottom: 7px;
@@ -471,28 +429,23 @@ body::after {
     color: #0b2d5c;
 
     font-size: 14px;
-
     font-weight: bold;
 }
-
 
 /* =========================================================
    INPUT
 ========================================================= */
 
 .form-group input {
-
     width: 100%;
 
     padding: 13px 14px;
 
-    border:
-        1px solid #cbd5e1;
+    border: 1px solid #cbd5e1;
 
     border-radius: 9px;
 
     background: #ffffff;
-
     color: #1f2937;
 
     font-size: 14px;
@@ -500,15 +453,11 @@ body::after {
     transition: 0.2s;
 }
 
-
 .form-group input::placeholder {
-
     color: #9ca3af;
 }
 
-
 .form-group input:focus {
-
     outline: none;
 
     border-color: #164a8a;
@@ -518,21 +467,17 @@ body::after {
         rgba(212, 175, 55, 0.18);
 }
 
-
 /* =========================================================
    REGISTER BUTTON
 ========================================================= */
 
 .register-button {
-
     width: 100%;
 
     padding: 13px;
-
     margin-top: 5px;
 
     border: none;
-
     border-radius: 9px;
 
     background:
@@ -545,22 +490,17 @@ body::after {
     color: white;
 
     font-size: 15px;
-
     font-weight: bold;
 
     cursor: pointer;
 
-    border-bottom:
-        4px solid #d4af37;
+    border-bottom: 4px solid #d4af37;
 
     transition: 0.2s;
 }
 
-
 .register-button:hover {
-
-    transform:
-        translateY(-2px);
+    transform: translateY(-2px);
 
     box-shadow:
         0 7px 18px
@@ -574,81 +514,33 @@ body::after {
         );
 }
 
-
 /* =========================================================
    LINKS
 ========================================================= */
 
 .login-link {
-
     text-align: center;
 
     margin-top: 22px;
-
     padding-top: 20px;
 
-    border-top:
-        1px solid #e5e7eb;
+    border-top: 1px solid #e5e7eb;
 
     font-size: 14px;
-
     color: #64748b;
 }
 
-
 .login-link a {
-
     color: #164a8a;
 
     font-weight: bold;
-
     text-decoration: none;
 }
-
 
 .login-link a:hover {
-
     color: #92701c;
-
     text-decoration: underline;
 }
-
-
-/* =========================================================
-   BACK HOME
-========================================================= */
-
-.back-home {
-
-    display: block;
-
-    text-align: center;
-
-    margin-top: 15px;
-
-    color: #164a8a;
-
-    text-decoration: none;
-
-    font-size: 13px;
-
-    font-weight: bold;
-
-    padding: 8px;
-
-    border-radius: 7px;
-
-    transition: 0.2s;
-}
-
-
-.back-home:hover {
-
-    background: #fff8dc;
-
-    color: #92701c;
-}
-
 
 /* =========================================================
    MOBILE
@@ -657,37 +549,28 @@ body::after {
 @media (max-width: 500px) {
 
     body {
-
         padding: 15px;
     }
 
     .register-header {
-
-        padding:
-            25px 20px 23px;
+        padding: 25px 20px 23px;
     }
 
     .register-body {
-
         padding: 25px 20px;
     }
 
     .register-header h1 {
-
         font-size: 24px;
     }
 
     .logo-container {
-
         width: 72px;
-
         height: 72px;
     }
 
     .logo-container img {
-
         width: 56px;
-
         height: 56px;
     }
 
@@ -699,21 +582,13 @@ body::after {
 
 <body>
 
-
 <div class="register-wrapper">
-
 
     <div class="register-card">
 
-
-        <!-- =================================================
-             HEADER
-        ================================================== -->
+        <!-- HEADER -->
 
         <div class="register-header">
-
-
-            <!-- RTU LOGO -->
 
             <div class="logo-container">
 
@@ -724,45 +599,31 @@ body::after {
 
             </div>
 
-
             <h1>
                 Create Account
             </h1>
-
 
             <p>
                 Register for the RTU Lost and Found System
             </p>
 
-
         </div>
 
-
-        <!-- =================================================
-             FORM
-        ================================================== -->
+        <!-- FORM -->
 
         <div class="register-body">
 
-
             <?php if (!empty($message)): ?>
 
-                <div
-                    class="message
-                    <?php echo $message_type; ?>"
-                >
+                <div class="message <?php echo e($message_type); ?>">
 
-                    <?php
-                    echo htmlspecialchars($message);
-                    ?>
+                    <?php echo e($message); ?>
 
                 </div>
 
             <?php endif; ?>
 
-
-            <form method="POST">
-
+            <form method="POST" action="">
 
                 <!-- STUDENT ID -->
 
@@ -777,16 +638,11 @@ body::after {
                         id="student_id"
                         name="student_id"
                         placeholder="Enter your student ID"
-                        value="<?php
-                            echo isset($_POST["student_id"])
-                                ? htmlspecialchars($_POST["student_id"])
-                                : "";
-                        ?>"
+                        value="<?php echo e($_POST["student_id"] ?? ""); ?>"
                         required
                     >
 
                 </div>
-
 
                 <!-- FULL NAME -->
 
@@ -801,16 +657,11 @@ body::after {
                         id="name"
                         name="name"
                         placeholder="Enter your full name"
-                        value="<?php
-                            echo isset($_POST["name"])
-                                ? htmlspecialchars($_POST["name"])
-                                : "";
-                        ?>"
+                        value="<?php echo e($_POST["name"] ?? ""); ?>"
                         required
                     >
 
                 </div>
-
 
                 <!-- EMAIL -->
 
@@ -825,16 +676,11 @@ body::after {
                         id="email"
                         name="email"
                         placeholder="Enter your email"
-                        value="<?php
-                            echo isset($_POST["email"])
-                                ? htmlspecialchars($_POST["email"])
-                                : "";
-                        ?>"
+                        value="<?php echo e($_POST["email"] ?? ""); ?>"
                         required
                     >
 
                 </div>
-
 
                 <!-- PASSWORD -->
 
@@ -854,7 +700,6 @@ body::after {
 
                 </div>
 
-
                 <!-- REGISTER -->
 
                 <button
@@ -864,9 +709,7 @@ body::after {
                     Create Account
                 </button>
 
-
             </form>
-
 
             <!-- LOGIN -->
 
@@ -880,20 +723,11 @@ body::after {
 
             </div>
 
-
-            <!-- HOME -->
-
-         
-
         </div>
-
 
     </div>
 
-
 </div>
 
-
 </body>
-
 </html>

@@ -27,8 +27,10 @@ __pycache__/
 .DS_Store
 
 /config/database.php
+/config/supabase.php
 
 # AI environment and downloaded models
 ai/venv/
 ai/__pycache__/
 ai/models/
+

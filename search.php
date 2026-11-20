@@ -1,232 +1,198 @@
+
 <?php
 
 session_start();
 
-/*
-    Prevent browser caching
-*/
+/* =========================================================
+   PREVENT BROWSER CACHING
+========================================================= */
 
 header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
 header("Cache-Control: post-check=0, pre-check=0", false);
 header("Pragma: no-cache");
 header("Expires: 0");
 
-
-/*
-    Check if user is logged in
-*/
+/* =========================================================
+   LOGIN CHECK
+========================================================= */
 
 if (!isset($_SESSION["user_id"])) {
     header("Location: login.php");
     exit();
 }
 
+/* =========================================================
+   DATABASE - SUPABASE PDO
+========================================================= */
 
-require_once "config/database.php";
+require_once __DIR__ . "/config/supabase.php";
 
+/* =========================================================
+   HELPER FUNCTION
+========================================================= */
 
-/*
-    Get search and filter values
-*/
-
-$search = "";
-$type = "";
-$category = "";
-
-$result = null;
-
-
-if (isset($_GET["search"])) {
-    $search = trim($_GET["search"]);
+function e($value) {
+    return htmlspecialchars((string) $value, ENT_QUOTES, "UTF-8");
 }
 
+/* =========================================================
+   SEARCH AND FILTER VALUES
+========================================================= */
 
-if (isset($_GET["type"])) {
-    $type = trim($_GET["type"]);
-}
+$search = trim($_GET["search"] ?? "");
+$type = trim($_GET["type"] ?? "");
+$category = trim($_GET["category"] ?? "");
 
+$items = [];
+$total_items = 0;
+$db_error = "";
 
-if (isset($_GET["category"])) {
-    $category = trim($_GET["category"]);
-}
+/* =========================================================
+   SEARCH ITEMS
+========================================================= */
 
+try {
 
-/*
-    Search items
-*/
-
-$sql = "
-    SELECT
-        id,
-        item_type,
-        item_name,
-        category,
-        description,
-        location,
-        date_reported,
-        image,
-        status
-    FROM items
-    WHERE 1=1
-";
-
-
-$params = [];
-
-$types = "";
-
-
-/*
-    Search keyword
-*/
-
-if (!empty($search)) {
-
-    $sql .= "
-        AND (
-            item_name LIKE ?
-            OR category LIKE ?
-            OR description LIKE ?
-            OR location LIKE ?
-        )
+    $sql = "
+        SELECT
+            id,
+            item_type,
+            item_name,
+            category,
+            description,
+            location,
+            date_reported,
+            image,
+            status
+        FROM items
+        WHERE 1=1
     ";
 
-    $search_term = "%" . $search . "%";
+    $params = [];
 
-    $params[] = $search_term;
-    $params[] = $search_term;
-    $params[] = $search_term;
-    $params[] = $search_term;
+    /* SEARCH KEYWORD */
 
-    $types .= "ssss";
+    if ($search !== "") {
 
-}
+        $sql .= "
+            AND (
+                item_name ILIKE :search_name
+                OR category ILIKE :search_category
+                OR description ILIKE :search_description
+                OR location ILIKE :search_location
+            )
+        ";
 
+        $search_term = "%" . $search . "%";
 
-/*
-    Filter by LOST or FOUND
-*/
+        $params[":search_name"] = $search_term;
+        $params[":search_category"] = $search_term;
+        $params[":search_description"] = $search_term;
+        $params[":search_location"] = $search_term;
 
-if (
-    $type === "lost" ||
-    $type === "found"
-) {
+    }
+
+    /* FILTER BY LOST OR FOUND */
+
+    if ($type === "lost" || $type === "found") {
+
+        $sql .= "
+            AND LOWER(TRIM(item_type)) = :item_type
+        ";
+
+        $params[":item_type"] = strtolower($type);
+
+    }
+
+    /* FILTER BY CATEGORY */
+
+    if ($category !== "") {
+
+        $sql .= "
+            AND LOWER(TRIM(category)) = LOWER(TRIM(:category))
+        ";
+
+        $params[":category"] = $category;
+
+    }
+
+    /* ORDER RESULTS */
 
     $sql .= "
-        AND LOWER(TRIM(item_type)) = ?
+        ORDER BY created_at DESC
     ";
 
-    $params[] = strtolower($type);
+    $stmt = $supabase->prepare($sql);
 
-    $types .= "s";
+    $stmt->execute($params);
 
-}
+    $items = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
+    $total_items = count($items);
 
-/*
-    Filter by CATEGORY
-*/
+} catch (PDOException $e) {
 
-if (!empty($category)) {
+    error_log("Search items error: " . $e->getMessage());
 
-    $sql .= "
-        AND LOWER(TRIM(category)) = LOWER(TRIM(?))
-    ";
-
-    $params[] = $category;
-
-    $types .= "s";
+    $db_error = "Unable to load items right now. Please try again later.";
 
 }
 
-
-$sql .= "
-    ORDER BY created_at DESC
-";
-
-
-$stmt = $conn->prepare($sql);
-
-
-if (!empty($params)) {
-
-    $stmt->bind_param(
-        $types,
-        ...$params
-    );
-
-}
-
-
-$stmt->execute();
-
-$result = $stmt->get_result();
-
-
-/*
-    Get current user's profile information
-*/
+/* =========================================================
+   CURRENT USER PROFILE
+========================================================= */
 
 $nav_user_id = (int) $_SESSION["user_id"];
 
+try {
 
-$nav_stmt = $conn->prepare("
-    SELECT
-        name,
-        email,
-        role
-    FROM users
-    WHERE id = ?
-    LIMIT 1
-");
+    $nav_stmt = $supabase->prepare("
+        SELECT
+            name,
+            email,
+            role
+        FROM users
+        WHERE id = :user_id
+        LIMIT 1
+    ");
 
+    $nav_stmt->execute([
+        ":user_id" => $nav_user_id
+    ]);
 
-$nav_stmt->bind_param(
-    "i",
-    $nav_user_id
-);
+    $nav_user = $nav_stmt->fetch(PDO::FETCH_ASSOC);
 
+    if (!$nav_user) {
+        session_destroy();
+        header("Location: login.php");
+        exit();
+    }
 
-$nav_stmt->execute();
+} catch (PDOException $e) {
 
+    error_log("Search page profile error: " . $e->getMessage());
 
-$nav_result = $nav_stmt->get_result();
+    die("Unable to load your account information. Please try again later.");
 
+}
 
-$nav_user = $nav_result->fetch_assoc();
-
-
-$nav_stmt->close();
-
-
-/*
-    Profile information
-*/
+/* =========================================================
+   PROFILE INFORMATION
+========================================================= */
 
 $profile_name = !empty($nav_user["name"])
     ? $nav_user["name"]
     : "User";
 
-
 $profile_email = !empty($nav_user["email"])
     ? $nav_user["email"]
     : "";
 
-
-/*
-    Get first letter of user's name
-*/
-
 $profile_initial = strtoupper(
-    substr(
-        trim($profile_name),
-        0,
-        1
-    )
+    substr(trim($profile_name), 0, 1)
 );
 
-
-if (empty($profile_initial)) {
+if ($profile_initial === "") {
     $profile_initial = "U";
 }
 
@@ -234,37 +200,21 @@ if (empty($profile_initial)) {
 
 
 <!DOCTYPE html>
-
 <html lang="en">
 
 <head>
 
 <meta charset="UTF-8">
 
-<meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
->
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-<meta
-    http-equiv="Cache-Control"
-    content="no-cache, no-store, must-revalidate"
->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 
-<meta
-    http-equiv="Pragma"
-    content="no-cache"
->
+<meta http-equiv="Pragma" content="no-cache">
 
-<meta
-    http-equiv="Expires"
-    content="0"
->
+<meta http-equiv="Expires" content="0">
 
-<title>
-    Search Items - RTU Lost and Found
-</title>
-
+<title>Search Items - RTU Lost and Found</title>
 
 <style>
 
@@ -278,60 +228,41 @@ if (empty($profile_initial)) {
     padding: 0;
 }
 
-
 body {
     font-family: Arial, Helvetica, sans-serif;
     background: #f3f6fb;
     color: #1f2937;
 }
 
-
 /* =========================================================
-   NAVBAR - RTU DASHBOARD DESIGN
+   NAVBAR
 ========================================================= */
 
 .navbar {
     width: 100%;
     min-height: 70px;
-
-    background: linear-gradient(
-        135deg,
-        #0f2f5f,
-        #164a8a
-    );
-
+    background: linear-gradient(135deg, #0f2f5f, #164a8a);
     color: white;
-
     display: flex;
     align-items: center;
     justify-content: space-between;
-
     padding: 10px 28px;
-
     border-bottom: 4px solid #d4af37;
-
     box-shadow: 0 4px 15px rgba(15, 47, 95, 0.20);
-
     position: relative;
     z-index: 1000;
 }
 
-
-/* =========================================================
-   BRAND
-========================================================= */
+/* BRAND */
 
 .brand {
     display: flex;
     align-items: center;
     gap: 10px;
-
     text-decoration: none;
     color: white;
-
     flex-shrink: 0;
 }
-
 
 .brand-title {
     font-size: 21px;
@@ -340,149 +271,91 @@ body {
     white-space: nowrap;
 }
 
-
 .brand-logo {
     width: 46px;
     height: 46px;
-
     object-fit: contain;
     display: block;
 }
 
-
-/* =========================================================
-   PROFILE CONTAINER
-========================================================= */
+/* PROFILE */
 
 .profile-container {
     position: relative;
 }
 
-
-/* =========================================================
-   PROFILE BUTTON
-========================================================= */
-
 .profile-button {
     display: flex;
     align-items: center;
     gap: 9px;
-
     background: transparent;
     border: none;
-
     color: white;
     cursor: pointer;
-
     padding: 5px 7px;
     border-radius: 30px;
-
     font-family: Arial, Helvetica, sans-serif;
-
     transition: background 0.2s;
 }
-
 
 .profile-button:hover {
     background: rgba(255, 255, 255, 0.12);
 }
 
-
-/* =========================================================
-   PROFILE NAME
-========================================================= */
-
 .profile-name {
     font-size: 14px;
     font-weight: 600;
-
     max-width: 160px;
-
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-
-/* =========================================================
-   PROFILE CIRCLE
-========================================================= */
-
 .profile-circle {
     width: 40px;
     height: 40px;
     min-width: 40px;
-
     border-radius: 50%;
-
     background: #d4af37;
     color: #0f2f5f;
-
     display: flex;
     align-items: center;
     justify-content: center;
-
     font-size: 16px;
     font-weight: bold;
-
     border: 2px solid rgba(255, 255, 255, 0.8);
 }
-
-
-/* =========================================================
-   PROFILE ARROW
-========================================================= */
 
 .profile-arrow {
     width: 0;
     height: 0;
-
     border-left: 5px solid transparent;
     border-right: 5px solid transparent;
     border-top: 6px solid white;
-
     transition: transform 0.2s;
 }
-
 
 .profile-button.open .profile-arrow {
     transform: rotate(180deg);
 }
 
-
-/* =========================================================
-   PROFILE DROPDOWN
-========================================================= */
+/* PROFILE DROPDOWN */
 
 .profile-dropdown {
     position: absolute;
-
     top: calc(100% + 12px);
     right: 0;
-
     width: 310px;
-
     background: white;
-
     border-radius: 16px;
-
     box-shadow: 0 10px 35px rgba(0, 0, 0, 0.20);
-
     border: 1px solid #e2e8f0;
-
     overflow: hidden;
-
     opacity: 0;
     visibility: hidden;
-
     transform: translateY(-8px);
-
-    transition:
-        opacity 0.2s,
-        transform 0.2s,
-        visibility 0.2s;
+    transition: opacity 0.2s, transform 0.2s, visibility 0.2s;
 }
-
 
 .profile-dropdown.show {
     opacity: 1;
@@ -490,121 +363,79 @@ body {
     transform: translateY(0);
 }
 
-
-/* =========================================================
-   DROPDOWN PROFILE HEADER
-========================================================= */
+/* DROPDOWN PROFILE HEADER */
 
 .profile-header {
     padding: 20px;
-
     display: flex;
     align-items: center;
     gap: 13px;
-
     background: white;
-
     border-bottom: 1px solid #e5e7eb;
 }
-
-
-/* =========================================================
-   DROPDOWN PROFILE CIRCLE
-========================================================= */
 
 .profile-header-circle {
     width: 48px;
     height: 48px;
     min-width: 48px;
-
     border-radius: 50%;
-
     background: #0f2f5f;
     color: white;
-
     display: flex;
     align-items: center;
     justify-content: center;
-
     font-size: 19px;
     font-weight: bold;
-
     border: 3px solid #d4af37;
 }
-
-
-/* =========================================================
-   PROFILE INFORMATION
-========================================================= */
 
 .profile-details {
     min-width: 0;
 }
 
-
 .profile-details strong {
     display: block;
-
     color: #172554;
     font-size: 15px;
-
     margin-bottom: 4px;
-
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
-
 
 .profile-details span {
     display: block;
-
     color: #64748b;
     font-size: 12px;
-
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
-
-/* =========================================================
-   DROPDOWN LINKS
-========================================================= */
+/* DROPDOWN LINKS */
 
 .dropdown-links {
     padding: 8px;
 }
 
-
 .dropdown-link {
     display: flex;
     align-items: center;
     justify-content: space-between;
-
     width: 100%;
-
     padding: 12px 13px;
-
     color: #334155;
     text-decoration: none;
-
     border-radius: 9px;
-
     font-size: 14px;
     font-weight: 600;
-
-    transition:
-        background 0.2s,
-        color 0.2s;
+    transition: background 0.2s, color 0.2s;
 }
-
 
 .dropdown-link:hover {
     background: #eff6ff;
     color: #164a8a;
 }
-
 
 .dropdown-link-content {
     display: flex;
@@ -612,74 +443,42 @@ body {
     gap: 10px;
 }
 
-
-/* =========================================================
-   DROPDOWN MARKER
-========================================================= */
-
 .dropdown-marker {
     width: 7px;
     height: 7px;
-
     border-radius: 50%;
-
     background: #d4af37;
-
     flex-shrink: 0;
 }
-
-
-/* =========================================================
-   SIGN OUT
-========================================================= */
 
 .signout {
     color: #b91c1c !important;
 }
-
 
 .signout:hover {
     background: #fef2f2 !important;
     color: #991b1b !important;
 }
 
-
-/* =========================================================
-   MAIN CONTAINER
-========================================================= */
+/* MAIN CONTAINER */
 
 .container {
     width: 92%;
     max-width: 1200px;
-
     margin: 28px auto 50px;
 }
 
-
-/* =========================================================
-   PAGE HEADER
-========================================================= */
+/* PAGE HEADER */
 
 .header {
-    background: linear-gradient(
-        135deg,
-        #0f2f5f,
-        #164a8a
-    );
-
+    background: linear-gradient(135deg, #0f2f5f, #164a8a);
     color: white;
-
     padding: 30px;
-
     border-radius: 16px;
-
     margin-bottom: 25px;
-
     box-shadow: 0 8px 25px rgba(15, 47, 95, 0.20);
-
     border-bottom: 4px solid #d4af37;
 }
-
 
 .header h1 {
     margin: 0 0 8px 0;
@@ -687,32 +486,22 @@ body {
     color: #ffffff;
 }
 
-
 .header p {
     margin: 0;
     color: #e5e7eb;
     font-size: 15px;
 }
 
-
-/* =========================================================
-   SEARCH AREA
-========================================================= */
+/* SEARCH AREA */
 
 .search-box {
     background: white;
-
     padding: 24px;
-
     border-radius: 16px;
-
     margin-bottom: 28px;
-
     box-shadow: 0 5px 18px rgba(0, 0, 0, 0.08);
-
     border: 1px solid #e5e7eb;
 }
-
 
 .search-form {
     display: grid;
@@ -720,84 +509,54 @@ body {
     gap: 12px;
 }
 
-
 .search-form input,
 .search-form select {
     width: 100%;
-
     padding: 13px 14px;
-
     border: 1px solid #cbd5e1;
     border-radius: 9px;
-
     font-size: 14px;
-
     background: #ffffff;
     color: #1f2937;
-
     transition: 0.2s;
-
     cursor: pointer;
 }
-
 
 .search-form input {
     cursor: text;
 }
 
-
 .search-form input::placeholder {
     color: #9ca3af;
 }
 
-
 .search-form input:focus,
 .search-form select:focus {
     outline: none;
-
     border-color: #2563eb;
-
     box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
 }
 
-
-/* =========================================================
-   SEARCH BUTTON
-========================================================= */
+/* SEARCH BUTTON */
 
 .search-button {
     padding: 13px 22px;
-
     border: none;
     border-radius: 9px;
-
-    background: linear-gradient(
-        135deg,
-        #2563eb,
-        #164a8a
-    );
-
+    background: linear-gradient(135deg, #2563eb, #164a8a);
     color: white;
-
     font-weight: bold;
     cursor: pointer;
-
     transition: 0.2s;
-
     border-bottom: 3px solid #d4af37;
 }
 
-
 .search-button:hover {
     transform: translateY(-2px);
-
     box-shadow: 0 6px 15px rgba(37, 99, 235, 0.25);
 }
 
-
-/* =========================================================
-   FILTER SELECT HIGHLIGHT
-========================================================= */
+/* FILTER HIGHLIGHT */
 
 .search-form select.filtered {
     border-color: #d4af37;
@@ -805,20 +564,15 @@ body {
     font-weight: bold;
 }
 
-
-/* =========================================================
-   RESULTS HEADER
-========================================================= */
+/* RESULTS HEADER */
 
 .results-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
-
     margin-bottom: 18px;
     padding: 0 3px;
 }
-
 
 .results-header h2 {
     margin: 0;
@@ -826,293 +580,189 @@ body {
     font-size: 23px;
 }
 
-
 .results-count {
     color: #64748b;
     font-size: 14px;
-
     background: white;
-
     padding: 7px 12px;
-
     border-radius: 20px;
-
     border: 1px solid #e2e8f0;
 }
 
-
-/* =========================================================
-   ITEM GRID
-========================================================= */
+/* ITEM GRID */
 
 .items {
     display: grid;
-
     grid-template-columns: repeat(3, 1fr);
-
     gap: 22px;
 }
 
-
-/* =========================================================
-   ITEM CARD
-========================================================= */
+/* ITEM CARD */
 
 .item-card {
     background: white;
-
     border-radius: 16px;
-
     overflow: hidden;
-
     box-shadow: 0 5px 18px rgba(0, 0, 0, 0.08);
-
     border: 1px solid #e5e7eb;
-
     transition: 0.25s;
-
     position: relative;
 }
 
-
 .item-card:hover {
     transform: translateY(-5px);
-
     box-shadow: 0 10px 28px rgba(15, 47, 95, 0.15);
-
     border-color: #d4af37;
 }
 
-
-/* =========================================================
-   ITEM IMAGE
-========================================================= */
+/* ITEM IMAGE */
 
 .item-image {
     width: 100%;
     height: 215px;
-
     object-fit: cover;
     display: block;
-
     background: #e5e7eb;
 }
 
-
 .no-image {
     height: 215px;
-
     display: flex;
     align-items: center;
     justify-content: center;
-
-    background: linear-gradient(
-        135deg,
-        #e5e7eb,
-        #f1f5f9
-    );
-
+    background: linear-gradient(135deg, #e5e7eb, #f1f5f9);
     color: #64748b;
     font-size: 14px;
 }
 
-
-/* =========================================================
-   ITEM CONTENT
-========================================================= */
+/* ITEM CONTENT */
 
 .item-content {
     padding: 21px;
 }
 
-
 .item-content h3 {
     margin: 0 0 12px 0;
-
     color: #12345b;
     font-size: 20px;
-
     line-height: 1.3;
 }
 
-
-/* =========================================================
-   BADGES
-========================================================= */
+/* BADGES */
 
 .badges {
     display: flex;
     flex-wrap: wrap;
-
     gap: 7px;
-
     margin-bottom: 16px;
 }
 
-
 .badge {
     padding: 6px 11px;
-
     border-radius: 20px;
-
     font-size: 11px;
     font-weight: bold;
-
     letter-spacing: 0.3px;
 }
-
-
-/* =========================================================
-   LOST
-========================================================= */
 
 .lost-badge {
     background: #fee2e2;
     color: #b91c1c;
-
     border: 1px solid #fecaca;
 }
-
-
-/* =========================================================
-   FOUND
-========================================================= */
 
 .found-badge {
     background: #dbeafe;
     color: #1d4ed8;
-
     border: 1px solid #bfdbfe;
 }
-
-
-/* =========================================================
-   STATUS
-========================================================= */
 
 .status-badge {
     background: #fff8dc;
     color: #92701c;
-
     border: 1px solid #e8cf72;
 }
 
-
-/* =========================================================
-   ITEM INFORMATION
-========================================================= */
+/* ITEM INFORMATION */
 
 .item-info {
     font-size: 14px;
-
     line-height: 1.7;
-
     color: #64748b;
-
     margin-bottom: 17px;
+    overflow-wrap: anywhere;
 }
-
 
 .item-info > div {
     padding: 5px 0;
-
     border-bottom: 1px solid #f1f5f9;
 }
-
 
 .item-info > div:last-child {
     border-bottom: none;
 }
 
-
 .item-info strong {
     color: #334155;
 }
 
-
-/* =========================================================
-   VIEW BUTTON
-========================================================= */
+/* VIEW BUTTON */
 
 .view-button {
     display: block;
-
     text-align: center;
-
     padding: 11px;
-
-    background: linear-gradient(
-        135deg,
-        #2563eb,
-        #164a8a
-    );
-
+    background: linear-gradient(135deg, #2563eb, #164a8a);
     color: white;
-
     text-decoration: none;
-
     border-radius: 9px;
-
     font-weight: bold;
     font-size: 14px;
-
     border-bottom: 3px solid #d4af37;
-
     transition: 0.2s;
 }
 
-
 .view-button:hover {
     transform: translateY(-2px);
-
-    background: linear-gradient(
-        135deg,
-        #1d4ed8,
-        #123d73
-    );
-
+    background: linear-gradient(135deg, #1d4ed8, #123d73);
     box-shadow: 0 5px 14px rgba(37, 99, 235, 0.25);
 }
 
-
-/* =========================================================
-   NO RESULTS
-========================================================= */
+/* NO RESULTS */
 
 .no-results {
     background: white;
-
     padding: 55px 30px;
-
     text-align: center;
-
     border-radius: 16px;
-
     color: #64748b;
-
     box-shadow: 0 5px 18px rgba(0, 0, 0, 0.08);
-
     border: 1px solid #e5e7eb;
 }
 
-
 .no-results h3 {
     color: #12345b;
-
     margin-bottom: 8px;
-
     font-size: 21px;
 }
-
 
 .no-results p {
     font-size: 14px;
 }
 
+/* DATABASE ERROR */
 
-/* =========================================================
-   RESPONSIVE
-========================================================= */
+.database-error {
+    background: #fee2e2;
+    color: #991b1b;
+    border: 1px solid #fecaca;
+    border-radius: 10px;
+    padding: 15px 18px;
+    margin-bottom: 20px;
+    font-size: 14px;
+}
+
+/* RESPONSIVE */
 
 @media (max-width: 900px) {
 
@@ -1125,7 +775,6 @@ body {
     }
 
 }
-
 
 @media (max-width: 800px) {
 
@@ -1147,7 +796,6 @@ body {
     }
 
 }
-
 
 @media (max-width: 700px) {
 
@@ -1211,9 +859,7 @@ body {
 
 </head>
 
-
 <body>
-
 
 <!-- =======================================================
      NAVIGATION
@@ -1221,13 +867,7 @@ body {
 
 <nav class="navbar">
 
-
-    <!-- BRAND: TITLE FIRST, LOGO AFTER TITLE -->
-
-    <a
-        href="dashboard.php"
-        class="brand"
-    >
+    <a href="dashboard.php" class="brand">
 
         <span class="brand-title">
             RTU Lost and Found
@@ -1240,7 +880,6 @@ body {
         >
 
     </a>
-
 
     <!-- PROFILE -->
 
@@ -1255,27 +894,16 @@ body {
         >
 
             <span class="profile-name">
-
-                <?php
-                echo htmlspecialchars($profile_name);
-                ?>
-
+                <?php echo e($profile_name); ?>
             </span>
-
 
             <span class="profile-circle">
-
-                <?php
-                echo htmlspecialchars($profile_initial);
-                ?>
-
+                <?php echo e($profile_initial); ?>
             </span>
-
 
             <span class="profile-arrow"></span>
 
         </button>
-
 
         <!-- PROFILE DROPDOWN -->
 
@@ -1284,90 +912,51 @@ body {
             id="profileDropdown"
         >
 
-            <!-- PROFILE INFORMATION -->
-
             <div class="profile-header">
 
                 <div class="profile-header-circle">
-
-                    <?php
-                    echo htmlspecialchars($profile_initial);
-                    ?>
-
+                    <?php echo e($profile_initial); ?>
                 </div>
-
 
                 <div class="profile-details">
 
                     <strong>
-
-                        <?php
-                        echo htmlspecialchars($profile_name);
-                        ?>
-
+                        <?php echo e($profile_name); ?>
                     </strong>
 
-
                     <span>
-
-                        <?php
-                        echo htmlspecialchars($profile_email);
-                        ?>
-
+                        <?php echo e($profile_email); ?>
                     </span>
 
                 </div>
 
             </div>
 
-
-            <!-- DROPDOWN LINKS -->
-
             <div class="dropdown-links">
 
-                <a
-                    href="messages.php"
-                    class="dropdown-link"
-                >
+                <a href="messages.php" class="dropdown-link">
 
                     <span class="dropdown-link-content">
-
                         <span class="dropdown-marker"></span>
-
                         <span>Messages</span>
-
                     </span>
 
                 </a>
 
-
-                <a
-                    href="notifications.php"
-                    class="dropdown-link"
-                >
+                <a href="notifications.php" class="dropdown-link">
 
                     <span class="dropdown-link-content">
-
                         <span class="dropdown-marker"></span>
-
                         <span>Notifications</span>
-
                     </span>
 
                 </a>
 
-
-                <a
-                    href="logout.php"
-                    class="dropdown-link signout"
-                >
+                <a href="logout.php" class="dropdown-link signout">
 
                     <span class="dropdown-link-content">
-
                         <span class="dropdown-marker"></span>
-
                         <span>Sign Out</span>
-
                     </span>
 
                 </a>
@@ -1380,14 +969,11 @@ body {
 
 </nav>
 
-
-
 <!-- =======================================================
      MAIN CONTAINER
 ======================================================= -->
 
 <div class="container">
-
 
     <!-- PAGE HEADER -->
 
@@ -1403,7 +989,15 @@ body {
 
     </div>
 
+    <!-- DATABASE ERROR -->
 
+    <?php if ($db_error !== ""): ?>
+
+        <div class="database-error">
+            <?php echo e($db_error); ?>
+        </div>
+
+    <?php endif; ?>
 
     <!-- SEARCH BOX -->
 
@@ -1421,9 +1015,8 @@ body {
                 type="text"
                 name="search"
                 placeholder="Search item, description, or location..."
-                value="<?php echo htmlspecialchars($search); ?>"
+                value="<?php echo e($search); ?>"
             >
-
 
             <!-- TYPE -->
 
@@ -1433,10 +1026,7 @@ body {
                 onchange="applyFilter()"
             >
 
-                <option value="">
-                    All Types
-                </option>
-
+                <option value="">All Types</option>
 
                 <option
                     value="lost"
@@ -1444,7 +1034,6 @@ body {
                 >
                     Lost Items
                 </option>
-
 
                 <option
                     value="found"
@@ -1455,8 +1044,6 @@ body {
 
             </select>
 
-
-
             <!-- CATEGORY -->
 
             <select
@@ -1465,125 +1052,41 @@ body {
                 onchange="applyFilter()"
             >
 
-                <option value="">
-                    All Categories
-                </option>
+                <option value="">All Categories</option>
 
+                <?php
 
-                <option
-                    value="Wallet"
-                    <?php echo ($category === "Wallet") ? "selected" : ""; ?>
-                >
-                    Wallet
-                </option>
+                $categories = [
+                    "Wallet",
+                    "Phone",
+                    "Laptop",
+                    "Tablet",
+                    "ID / Identification Card",
+                    "School Supplies",
+                    "Bag",
+                    "Clothing",
+                    "Keys",
+                    "Accessories",
+                    "Electronic Device",
+                    "Books",
+                    "Documents",
+                    "Other"
+                ];
 
+                foreach ($categories as $cat):
 
-                <option
-                    value="Phone"
-                    <?php echo ($category === "Phone") ? "selected" : ""; ?>
-                >
-                    Phone
-                </option>
+                ?>
 
+                    <option
+                        value="<?php echo e($cat); ?>"
+                        <?php echo ($category === $cat) ? "selected" : ""; ?>
+                    >
+                        <?php echo e($cat); ?>
+                    </option>
 
-                <option
-                    value="Laptop"
-                    <?php echo ($category === "Laptop") ? "selected" : ""; ?>
-                >
-                    Laptop
-                </option>
-
-
-                <option
-                    value="Tablet"
-                    <?php echo ($category === "Tablet") ? "selected" : ""; ?>
-                >
-                    Tablet
-                </option>
-
-
-                <option
-                    value="ID / Identification Card"
-                    <?php echo ($category === "ID / Identification Card") ? "selected" : ""; ?>
-                >
-                    ID / Identification Card
-                </option>
-
-
-                <option
-                    value="School Supplies"
-                    <?php echo ($category === "School Supplies") ? "selected" : ""; ?>
-                >
-                    School Supplies
-                </option>
-
-
-                <option
-                    value="Bag"
-                    <?php echo ($category === "Bag") ? "selected" : ""; ?>
-                >
-                    Bag
-                </option>
-
-
-                <option
-                    value="Clothing"
-                    <?php echo ($category === "Clothing") ? "selected" : ""; ?>
-                >
-                    Clothing
-                </option>
-
-
-                <option
-                    value="Keys"
-                    <?php echo ($category === "Keys") ? "selected" : ""; ?>
-                >
-                    Keys
-                </option>
-
-
-                <option
-                    value="Accessories"
-                    <?php echo ($category === "Accessories") ? "selected" : ""; ?>
-                >
-                    Accessories
-                </option>
-
-
-                <option
-                    value="Electronic Device"
-                    <?php echo ($category === "Electronic Device") ? "selected" : ""; ?>
-                >
-                    Electronic Device
-                </option>
-
-
-                <option
-                    value="Books"
-                    <?php echo ($category === "Books") ? "selected" : ""; ?>
-                >
-                    Books
-                </option>
-
-
-                <option
-                    value="Documents"
-                    <?php echo ($category === "Documents") ? "selected" : ""; ?>
-                >
-                    Documents
-                </option>
-
-
-                <option
-                    value="Other"
-                    <?php echo ($category === "Other") ? "selected" : ""; ?>
-                >
-                    Other
-                </option>
+                <?php endforeach; ?>
 
             </select>
-
-
 
             <!-- SEARCH BUTTON -->
 
@@ -1598,8 +1101,6 @@ body {
 
     </div>
 
-
-
     <!-- RESULTS HEADER -->
 
     <div class="results-header">
@@ -1608,292 +1109,221 @@ body {
 
             <?php
 
-            echo empty($search)
-                && empty($type)
-                && empty($category)
-
+            echo (
+                $search === "" &&
+                $type === "" &&
+                $category === ""
+            )
                 ? "All Reports"
-
                 : "Search Results";
 
             ?>
 
         </h2>
 
-
         <span class="results-count">
 
-            <?php
-
-            echo $result
-                ? $result->num_rows . " item(s)"
-                : "0 items";
-
-            ?>
+            <?php echo $total_items; ?>
+            item(s)
 
         </span>
 
     </div>
 
-
-
     <!-- RESULTS -->
 
-    <?php if (
-        $result &&
-        $result->num_rows > 0
-    ): ?>
+    <?php if ($db_error === ""): ?>
 
-        <div class="items">
+        <?php if ($total_items > 0): ?>
 
-            <?php while (
-                $item = $result->fetch_assoc()
-            ): ?>
+            <div class="items">
 
-                <div class="item-card">
+                <?php foreach ($items as $item): ?>
 
+                    <div class="item-card">
 
-                    <!-- ITEM IMAGE -->
+                        <!-- ITEM IMAGE -->
 
-                    <?php if (!empty($item["image"])): ?>
-
-                        <?php
-
-                        $image_folder = (
-
-                            strtolower(
-                                trim($item["item_type"])
-                            ) === "lost"
-
-                        )
-                            ? "uploads/lost/"
-                            : "uploads/found/";
-
-                        ?>
-
-
-                        <img
-                            class="item-image"
-                            src="<?php
-                                echo htmlspecialchars(
-                                    $image_folder . $item["image"]
-                                );
-                            ?>"
-                            alt="<?php
-                                echo htmlspecialchars($item["item_name"]);
-                            ?>"
-                            onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';"
-                        >
-
-
-                        <div
-                            class="no-image"
-                            style="display:none;"
-                        >
-                            Image unavailable
-                        </div>
-
-
-                    <?php else: ?>
-
-                        <div class="no-image">
-                            No Image Available
-                        </div>
-
-                    <?php endif; ?>
-
-
-
-                    <!-- ITEM CONTENT -->
-
-                    <div class="item-content">
-
-
-                        <h3>
+                        <?php if (!empty($item["image"])): ?>
 
                             <?php
-                            echo htmlspecialchars($item["item_name"]);
+
+                            $image_folder = (
+                                strtolower(trim($item["item_type"])) === "lost"
+                            )
+                                ? "uploads/lost/"
+                                : "uploads/found/";
+
+                            $image_url = $image_folder . $item["image"];
+
                             ?>
 
-                        </h3>
+                            <img
+                                class="item-image"
+                                src="<?php echo e($image_url); ?>"
+                                alt="<?php echo e($item["item_name"]); ?>"
+                                onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';"
+                            >
 
-
-
-                        <!-- BADGES -->
-
-                        <div class="badges">
-
-                            <?php if (
-                                strtolower(
-                                    trim($item["item_type"])
-                                ) === "lost"
-                            ): ?>
-
-                                <span class="badge lost-badge">
-                                    LOST
-                                </span>
-
-                            <?php else: ?>
-
-                                <span class="badge found-badge">
-                                    FOUND
-                                </span>
-
-                            <?php endif; ?>
-
-
-                            <!-- STATUS -->
-
-                            <span class="badge status-badge">
-
-                                <?php
-
-                                echo htmlspecialchars(
-                                    ucwords(
-                                        str_replace(
-                                            "_",
-                                            " ",
-                                            $item["status"]
-                                        )
-                                    )
-                                );
-
-                                ?>
-
-                            </span>
-
-                        </div>
-
-
-
-                        <!-- ITEM INFORMATION -->
-
-                        <div class="item-info">
-
-
-                            <div>
-
-                                <strong>
-                                    Category:
-                                </strong>
-
-                                <?php
-                                echo htmlspecialchars(
-                                    $item["category"] ?? "N/A"
-                                );
-                                ?>
-
+                            <div
+                                class="no-image"
+                                style="display:none;"
+                            >
+                                Image unavailable
                             </div>
 
+                        <?php else: ?>
 
-                            <div>
-
-                                <strong>
-                                    Location:
-                                </strong>
-
-                                <?php
-                                echo htmlspecialchars(
-                                    $item["location"] ?? "N/A"
-                                );
-                                ?>
-
+                            <div class="no-image">
+                                No Image Available
                             </div>
 
+                        <?php endif; ?>
 
-                            <div>
+                        <!-- ITEM CONTENT -->
 
-                                <strong>
-                                    Date:
-                                </strong>
+                        <div class="item-content">
 
-                                <?php
-                                echo htmlspecialchars($item["date_reported"]);
-                                ?>
+                            <h3>
+                                <?php echo e($item["item_name"]); ?>
+                            </h3>
 
-                            </div>
+                            <!-- BADGES -->
 
+                            <div class="badges">
 
-                            <?php if (!empty($item["description"])): ?>
+                                <?php if (
+                                    strtolower(trim($item["item_type"])) === "lost"
+                                ): ?>
 
-                                <div>
+                                    <span class="badge lost-badge">
+                                        LOST
+                                    </span>
 
-                                    <strong>
-                                        Description:
-                                    </strong>
+                                <?php else: ?>
+
+                                    <span class="badge found-badge">
+                                        FOUND
+                                    </span>
+
+                                <?php endif; ?>
+
+                                <span class="badge status-badge">
 
                                     <?php
 
-                                    $description = $item["description"];
-
-                                    if (strlen($description) > 100) {
-
-                                        $description = substr(
-                                            $description,
-                                            0,
-                                            100
-                                        ) . "...";
-
-                                    }
-
-                                    echo htmlspecialchars($description);
+                                    echo e(
+                                        ucwords(
+                                            str_replace(
+                                                "_",
+                                                " ",
+                                                $item["status"] ?? ""
+                                            )
+                                        )
+                                    );
 
                                     ?>
 
+                                </span>
+
+                            </div>
+
+                            <!-- ITEM INFORMATION -->
+
+                            <div class="item-info">
+
+                                <div>
+
+                                    <strong>Category:</strong>
+
+                                    <?php echo e($item["category"] ?? "N/A"); ?>
+
                                 </div>
 
-                            <?php endif; ?>
+                                <div>
 
+                                    <strong>Location:</strong>
+
+                                    <?php echo e($item["location"] ?? "N/A"); ?>
+
+                                </div>
+
+                                <div>
+
+                                    <strong>Date:</strong>
+
+                                    <?php echo e($item["date_reported"] ?? "N/A"); ?>
+
+                                </div>
+
+                                <?php if (!empty($item["description"])): ?>
+
+                                    <div>
+
+                                        <strong>Description:</strong>
+
+                                        <?php
+
+                                        $description = (string) $item["description"];
+
+                                        if (strlen($description) > 100) {
+
+                                            $description = substr(
+                                                $description,
+                                                0,
+                                                100
+                                            ) . "...";
+
+                                        }
+
+                                        echo e($description);
+
+                                        ?>
+
+                                    </div>
+
+                                <?php endif; ?>
+
+                            </div>
+
+                            <!-- VIEW ITEM -->
+
+                            <a
+                                class="view-button"
+                                href="item.php?id=<?php echo (int) $item["id"]; ?>"
+                            >
+                                View Item
+                            </a>
 
                         </div>
 
-
-
-                        <!-- VIEW ITEM -->
-
-                        <a
-                            class="view-button"
-                            href="item.php?id=<?php echo (int) $item["id"]; ?>"
-                        >
-                            View Item
-                        </a>
-
-
                     </div>
 
+                <?php endforeach; ?>
 
-                </div>
+            </div>
 
+        <?php else: ?>
 
-            <?php endwhile; ?>
+            <!-- NO RESULTS -->
 
-        </div>
+            <div class="no-results">
 
+                <h3>
+                    No matching items found
+                </h3>
 
-    <?php else: ?>
+                <p>
+                    Try using a different keyword or changing the filters.
+                </p>
 
+            </div>
 
-        <!-- NO RESULTS -->
-
-        <div class="no-results">
-
-            <h3>
-                No matching items found
-            </h3>
-
-            <p>
-                Try using a different keyword or changing the filters.
-            </p>
-
-        </div>
-
+        <?php endif; ?>
 
     <?php endif; ?>
 
-
 </div>
-
-
 
 <!-- =======================================================
      JAVASCRIPT
@@ -1901,9 +1331,7 @@ body {
 
 <script>
 
-/*
-    Search filter
-*/
+/* SEARCH FILTER */
 
 function applyFilter() {
 
@@ -1913,15 +1341,11 @@ function applyFilter() {
 
 }
 
-
-/*
-    Profile dropdown
-*/
+/* PROFILE DROPDOWN */
 
 const profileButton = document.getElementById("profileButton");
 
 const profileDropdown = document.getElementById("profileDropdown");
-
 
 profileButton.addEventListener("click", function(event) {
 
@@ -1938,10 +1362,7 @@ profileButton.addEventListener("click", function(event) {
 
 });
 
-
-/*
-    Close dropdown when clicking outside
-*/
+/* CLOSE DROPDOWN WHEN CLICKING OUTSIDE */
 
 document.addEventListener("click", function(event) {
 
@@ -1960,10 +1381,7 @@ document.addEventListener("click", function(event) {
 
 });
 
-
-/*
-    Highlight active filters
-*/
+/* HIGHLIGHT ACTIVE FILTERS */
 
 document.addEventListener("DOMContentLoaded", function() {
 
@@ -1971,40 +1389,27 @@ document.addEventListener("DOMContentLoaded", function() {
 
     const categoryFilter = document.getElementById("categoryFilter");
 
-
     if (typeFilter.value !== "") {
-
         typeFilter.classList.add("filtered");
-
     }
 
-
     if (categoryFilter.value !== "") {
-
         categoryFilter.classList.add("filtered");
-
     }
 
 });
 
-
-/*
-    Prevent browser back/forward cache
-*/
+/* PREVENT BROWSER BACK/FORWARD CACHE */
 
 window.addEventListener("pageshow", function(event) {
 
     if (event.persisted) {
-
         window.location.reload();
-
     }
 
 });
 
 </script>
 
-
 </body>
-
 </html>

@@ -12,7 +12,6 @@ header("Cache-Control: post-check=0, pre-check=0", false);
 header("Pragma: no-cache");
 header("Expires: 0");
 
-
 /* =========================================================
    LOGIN CHECK
 ========================================================= */
@@ -22,20 +21,35 @@ if (!isset($_SESSION["user_id"])) {
     exit();
 }
 
+/* =========================================================
+   SUPABASE CONNECTION
+========================================================= */
 
-require_once "config/database.php";
+require_once __DIR__ . "/config/supabase.php";
 
 $user_id = (int) $_SESSION["user_id"];
 
 $error = "";
 $success = "";
+$verification_code = "";
 
+/* =========================================================
+   HTML ESCAPE HELPER
+========================================================= */
+
+function e($value) {
+    return htmlspecialchars(
+        (string) ($value ?? ""),
+        ENT_QUOTES,
+        "UTF-8"
+    );
+}
 
 /* =========================================================
    CURRENT USER
 ========================================================= */
 
-$user_stmt = $conn->prepare("
+$user_stmt = $supabase->prepare("
     SELECT
         id,
         student_id,
@@ -43,20 +57,15 @@ $user_stmt = $conn->prepare("
         email,
         role
     FROM users
-    WHERE id = ?
+    WHERE id = :user_id
     LIMIT 1
 ");
 
-$user_stmt->bind_param("i", $user_id);
+$user_stmt->execute([
+    "user_id" => $user_id
+]);
 
-$user_stmt->execute();
-
-$current_user = $user_stmt
-    ->get_result()
-    ->fetch_assoc();
-
-$user_stmt->close();
-
+$current_user = $user_stmt->fetch(PDO::FETCH_ASSOC);
 
 if (!$current_user) {
 
@@ -67,35 +76,35 @@ if (!$current_user) {
     exit();
 }
 
-
 /* =========================================================
    UNREAD MESSAGES
 ========================================================= */
 
 $total_unread = 0;
 
-$unread_stmt = $conn->prepare("
-    SELECT COUNT(*) AS total_unread
-    FROM messages
-    WHERE receiver_id = ?
-    AND is_read = 0
-");
+try {
 
-if ($unread_stmt) {
+    $unread_stmt = $supabase->prepare("
+        SELECT COUNT(*) AS total_unread
+        FROM messages
+        WHERE receiver_id = :user_id
+        AND is_read = FALSE
+    ");
 
-    $unread_stmt->bind_param("i", $user_id);
+    $unread_stmt->execute([
+        "user_id" => $user_id
+    ]);
 
-    $unread_stmt->execute();
+    $unread_result = $unread_stmt->fetch(PDO::FETCH_ASSOC);
 
-    $unread_result = $unread_stmt
-        ->get_result()
-        ->fetch_assoc();
+    $total_unread = (int) ($unread_result["total_unread"] ?? 0);
 
-    $total_unread = (int) $unread_result["total_unread"];
+} catch (PDOException $e) {
 
-    $unread_stmt->close();
+    error_log("Unread messages error: " . $e->getMessage());
+
+    $total_unread = 0;
 }
-
 
 /* =========================================================
    UNREAD AI MATCH NOTIFICATIONS
@@ -103,40 +112,44 @@ if ($unread_stmt) {
 
 $notification_unread = 0;
 
-$notification_stmt = $conn->prepare("
-    SELECT COUNT(*) AS total
-    FROM notifications
-    WHERE user_id = ?
-    AND is_read = 0
-    AND type = 'ai_match'
-");
+try {
 
-if ($notification_stmt) {
+    $notification_stmt = $supabase->prepare("
+        SELECT COUNT(*) AS total
+        FROM notifications
+        WHERE user_id = :user_id
+        AND is_read = FALSE
+        AND type = 'ai_match'
+    ");
 
-    $notification_stmt->bind_param("i", $user_id);
+    $notification_stmt->execute([
+        "user_id" => $user_id
+    ]);
 
-    $notification_stmt->execute();
+    $notification_result = $notification_stmt->fetch(PDO::FETCH_ASSOC);
 
-    $notification_result = $notification_stmt
-        ->get_result()
-        ->fetch_assoc();
+    $notification_unread = (int) ($notification_result["total"] ?? 0);
 
-    $notification_unread = (int) $notification_result["total"];
+} catch (PDOException $e) {
 
-    $notification_stmt->close();
+    error_log("Notification count error: " . $e->getMessage());
+
+    $notification_unread = 0;
 }
-
 
 /* =========================================================
    PROFILE INITIAL
 ========================================================= */
 
-$name_for_initial = trim($current_user["name"]);
+$name_for_initial = trim($current_user["name"] ?? "");
 
 $profile_initial = strtoupper(
     substr($name_for_initial, 0, 1)
 );
 
+if ($profile_initial === "") {
+    $profile_initial = "U";
+}
 
 /* =========================================================
    FORM SUBMISSION
@@ -145,15 +158,10 @@ $profile_initial = strtoupper(
 if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
     $item_name = trim($_POST["item_name"] ?? "");
-
     $category = trim($_POST["category"] ?? "");
-
     $description = trim($_POST["description"] ?? "");
-
     $location = trim($_POST["location"] ?? "");
-
     $date_reported = $_POST["date_reported"] ?? "";
-
 
     /* =====================================================
        VALIDATION
@@ -194,6 +202,9 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
             )
         );
 
+        /* =================================================
+           IMAGE VALIDATION
+        ================================================= */
 
         if (!in_array($extension, $allowed_extensions, true)) {
 
@@ -205,129 +216,143 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
         } else {
 
+            $image_info = @getimagesize($image["tmp_name"]);
 
-            /* =================================================
-               UPLOAD FOLDER
-            ================================================= */
+            if ($image_info === false) {
 
-            $upload_folder = "uploads/lost/";
-
-            if (!is_dir($upload_folder)) {
-
-                mkdir(
-                    $upload_folder,
-                    0777,
-                    true
-                );
-
-            }
-
-
-            /* =================================================
-               IMAGE NAME
-            ================================================= */
-
-            $image_name = "lost_" .
-                bin2hex(random_bytes(6)) .
-                "." .
-                $extension;
-
-            $image_path = $upload_folder . $image_name;
-
-
-            /* =================================================
-               MOVE IMAGE
-            ================================================= */
-
-            if (!move_uploaded_file(
-                $image["tmp_name"],
-                $image_path
-            )) {
-
-                $error = "Failed to upload image.";
+                $error = "The uploaded file is not a valid image.";
 
             } else {
 
+                /* =========================================
+                   UPLOAD FOLDER
+                ========================================= */
 
-                /* =================================================
-                   INSERT LOST ITEM
-                ================================================= */
+                $upload_folder = __DIR__ . "/uploads/lost/";
 
-                $insert_stmt = $conn->prepare("
-                    INSERT INTO items
-                    (
-                        user_id,
-                        item_type,
-                        item_name,
-                        category,
-                        description,
-                        location,
-                        date_reported,
-                        image,
-                        status
-                    )
-                    VALUES
-                    (
-                        ?,
-                        'lost',
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        'lost'
-                    )
-                ");
+                if (
+                    !is_dir($upload_folder) &&
+                    !mkdir($upload_folder, 0775, true) &&
+                    !is_dir($upload_folder)
+                ) {
 
-
-                if (!$insert_stmt) {
-
-                    $error = "Unable to prepare the database request.";
-
-                    if (file_exists($image_path)) {
-                        unlink($image_path);
-                    }
+                    $error = "Unable to create the image upload folder.";
 
                 } else {
 
-                    $insert_stmt->bind_param(
-                        "issssss",
-                        $user_id,
-                        $item_name,
-                        $category,
-                        $description,
-                        $location,
-                        $date_reported,
-                        $image_name
-                    );
+                    /* =====================================
+                       IMAGE NAME
+                    ===================================== */
 
+                    $image_name = "lost_" .
+                        bin2hex(random_bytes(6)) .
+                        "." .
+                        $extension;
 
-                    /* =================================================
-                       SAVE LOST ITEM
-                    ================================================= */
+                    $image_path = $upload_folder . $image_name;
 
-                    if (!$insert_stmt->execute()) {
+                    /* =====================================
+                       MOVE IMAGE
+                    ===================================== */
 
-                        $error = "Failed to save the lost item.";
+                    if (!move_uploaded_file(
+                        $image["tmp_name"],
+                        $image_path
+                    )) {
 
-                        // Remove uploaded image if saving fails.
-                        if (file_exists($image_path)) {
-                            unlink($image_path);
-                        }
+                        $error = "Failed to upload image.";
 
                     } else {
 
-                        /* =================================================
-                           SUCCESS
-                           AI MATCHING IS RUN SEPARATELY
-                        ================================================= */
+                        /* =================================
+                           GENERATE VERIFICATION CODE
+                        ================================= */
 
-                        $success = "Lost item reported successfully.";
+                        $verification_code = "RTU-LST-" .
+                            strtoupper(bin2hex(random_bytes(8)));
+
+                        /* =================================
+                           INSERT LOST ITEM INTO SUPABASE
+                        ================================= */
+
+                        try {
+
+                            $insert_stmt = $supabase->prepare("
+                                INSERT INTO items
+                                (
+                                    user_id,
+                                    item_type,
+                                    item_name,
+                                    category,
+                                    description,
+                                    location,
+                                    date_reported,
+                                    image,
+                                    status,
+                                    verification_code
+                                )
+                                VALUES
+                                (
+                                    :user_id,
+                                    'lost',
+                                    :item_name,
+                                    :category,
+                                    :description,
+                                    :location,
+                                    :date_reported,
+                                    :image,
+                                    'lost',
+                                    :verification_code
+                                )
+                                RETURNING id
+                            ");
+
+                            $insert_stmt->execute([
+                                "user_id" => $user_id,
+                                "item_name" => $item_name,
+                                "category" => $category,
+                                "description" => $description,
+                                "location" => $location,
+                                "date_reported" => $date_reported,
+                                "image" => $image_name,
+                                "verification_code" => $verification_code
+                            ]);
+
+                            $new_item_id = $insert_stmt->fetchColumn();
+
+                            if (!$new_item_id) {
+                                throw new RuntimeException(
+                                    "The lost item report was not saved."
+                                );
+                            }
+
+                            /* =================================
+                               SUCCESS
+                            ================================= */
+
+                            $success = "Lost item reported successfully.";
+
+                            // Clear submitted form values after success.
+                            $_POST = [];
+
+                        } catch (Throwable $e) {
+
+                            error_log(
+                                "Lost item submission error: " . $e->getMessage()
+                            );
+
+                            $error = "Failed to save the lost item. Please try again.";
+
+                            $verification_code = "";
+
+                            // Remove uploaded image if database saving fails.
+                            if (file_exists($image_path)) {
+                                unlink($image_path);
+                            }
+
+                        }
 
                     }
-
-                    $insert_stmt->close();
 
                 }
 
@@ -373,7 +398,6 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
     Report Lost Item - RTU Lost and Found
 </title>
 
-
 <style>
 
 /* =========================================================
@@ -403,7 +427,6 @@ body {
     color:
         #1f2937;
 }
-
 
 /* =========================================================
    NAVBAR
@@ -450,7 +473,6 @@ body {
     z-index: 1000;
 }
 
-
 /* =========================================================
    BRAND
 ========================================================= */
@@ -490,7 +512,6 @@ body {
     display: block;
 }
 
-
 /* =========================================================
    PROFILE CONTAINER
 ========================================================= */
@@ -499,7 +520,6 @@ body {
 
     position: relative;
 }
-
 
 /* =========================================================
    PROFILE BUTTON
@@ -547,7 +567,6 @@ body {
         );
 }
 
-
 /* =========================================================
    PROFILE NAME
 ========================================================= */
@@ -566,7 +585,6 @@ body {
 
     white-space: nowrap;
 }
-
 
 /* =========================================================
    PROFILE CIRCLE
@@ -606,7 +624,6 @@ body {
         );
 }
 
-
 /* =========================================================
    ARROW
 ========================================================= */
@@ -635,7 +652,6 @@ body {
     transform:
         rotate(180deg);
 }
-
 
 /* =========================================================
    PROFILE DROPDOWN
@@ -692,7 +708,6 @@ body {
     transform:
         translateY(0);
 }
-
 
 /* =========================================================
    PROFILE HEADER
@@ -783,7 +798,6 @@ body {
     text-overflow: ellipsis;
 }
 
-
 /* =========================================================
    DROPDOWN LINKS
 ========================================================= */
@@ -854,7 +868,6 @@ body {
     flex-shrink: 0;
 }
 
-
 /* =========================================================
    NOTIFICATION BADGE
 ========================================================= */
@@ -886,7 +899,6 @@ body {
     font-weight: bold;
 }
 
-
 /* =========================================================
    DIVIDER
 ========================================================= */
@@ -901,7 +913,6 @@ body {
     margin:
         5px 12px;
 }
-
 
 /* =========================================================
    SIGN OUT
@@ -922,7 +933,6 @@ body {
         #991b1b !important;
 }
 
-
 /* =========================================================
    MAIN CONTAINER
 ========================================================= */
@@ -936,7 +946,6 @@ body {
     margin:
         30px auto 50px;
 }
-
 
 /* =========================================================
    PAGE HEADER
@@ -991,7 +1000,6 @@ body {
     font-size: 15px;
 }
 
-
 /* =========================================================
    FORM CARD
 ========================================================= */
@@ -1017,7 +1025,6 @@ body {
     border:
         1px solid #e5e7eb;
 }
-
 
 /* =========================================================
    ALERTS
@@ -1065,6 +1072,94 @@ body {
     font-size: 14px;
 }
 
+/* =========================================================
+   VERIFICATION CODE
+========================================================= */
+
+.verification-box {
+
+    margin-top: 15px;
+
+    padding: 17px;
+
+    background: white;
+
+    border:
+        1px solid #bbf7d0;
+
+    border-radius: 9px;
+}
+
+.verification-title {
+
+    display: block;
+
+    color:
+        #166534;
+
+    font-size: 14px;
+
+    font-weight: 700;
+
+    margin-bottom: 10px;
+}
+
+.verification-code {
+
+    display: block;
+
+    color:
+        #0f2f5f;
+
+    font-size: 23px;
+
+    font-weight: bold;
+
+    letter-spacing: 2px;
+
+    overflow-wrap: anywhere;
+
+    margin-bottom: 12px;
+}
+
+.copy-code-button {
+
+    padding:
+        9px 15px;
+
+    background:
+        #0f2f5f;
+
+    color: white;
+
+    border: none;
+
+    border-radius: 7px;
+
+    cursor: pointer;
+
+    font-weight: 600;
+
+    font-size: 13px;
+}
+
+.copy-code-button:hover {
+
+    background:
+        #164a8a;
+}
+
+.verification-note {
+
+    margin-top: 11px;
+
+    color:
+        #475569;
+
+    font-size: 12px;
+
+    line-height: 1.6;
+}
 
 /* =========================================================
    FORM
@@ -1166,7 +1261,6 @@ input[type="file"] {
         #64748b;
 }
 
-
 /* =========================================================
    AI INFORMATION
 ========================================================= */
@@ -1223,7 +1317,6 @@ input[type="file"] {
         #12345b;
 }
 
-
 /* =========================================================
    SUBMIT BUTTON
 ========================================================= */
@@ -1273,7 +1366,6 @@ input[type="file"] {
             0.25
         );
 }
-
 
 /* =========================================================
    RESPONSIVE
@@ -1333,8 +1425,12 @@ input[type="file"] {
 
         padding: 20px;
     }
-}
 
+    .verification-code {
+
+        font-size: 19px;
+    }
+}
 
 @media (max-width: 400px) {
 
@@ -1351,16 +1447,13 @@ input[type="file"] {
 
 </head>
 
-
 <body>
-
 
 <!-- =======================================================
      NAVBAR
 ======================================================= -->
 
 <nav class="navbar">
-
 
     <!-- BRAND -->
 
@@ -1381,7 +1474,6 @@ input[type="file"] {
 
     </a>
 
-
     <!-- PROFILE -->
 
     <div class="profile-container">
@@ -1394,30 +1486,19 @@ input[type="file"] {
 
             <span class="profile-name">
 
-                <?php
-                echo htmlspecialchars(
-                    $current_user["name"]
-                );
-                ?>
+                <?php echo e($current_user["name"]); ?>
 
             </span>
-
 
             <span class="profile-circle">
 
-                <?php
-                echo htmlspecialchars(
-                    $profile_initial
-                );
-                ?>
+                <?php echo e($profile_initial); ?>
 
             </span>
-
 
             <span class="profile-arrow"></span>
 
         </button>
-
 
         <!-- PROFILE DROPDOWN -->
 
@@ -1426,41 +1507,27 @@ input[type="file"] {
             id="profileDropdown"
         >
 
-
             <!-- PROFILE HEADER -->
 
             <div class="profile-header">
 
                 <div class="profile-header-circle">
 
-                    <?php
-                    echo htmlspecialchars(
-                        $profile_initial
-                    );
-                    ?>
+                    <?php echo e($profile_initial); ?>
 
                 </div>
-
 
                 <div class="profile-details">
 
                     <strong>
 
-                        <?php
-                        echo htmlspecialchars(
-                            $current_user["name"]
-                        );
-                        ?>
+                        <?php echo e($current_user["name"]); ?>
 
                     </strong>
 
                     <span>
 
-                        <?php
-                        echo htmlspecialchars(
-                            $current_user["email"]
-                        );
-                        ?>
+                        <?php echo e($current_user["email"]); ?>
 
                     </span>
 
@@ -1468,11 +1535,9 @@ input[type="file"] {
 
             </div>
 
-
             <!-- DROPDOWN LINKS -->
 
             <div class="dropdown-links">
-
 
                 <!-- MESSAGES -->
 
@@ -1493,16 +1558,13 @@ input[type="file"] {
 
                         <span class="dropdown-badge">
 
-                            <?php
-                            echo $total_unread;
-                            ?>
+                            <?php echo $total_unread; ?>
 
                         </span>
 
                     <?php endif; ?>
 
                 </a>
-
 
                 <!-- NOTIFICATIONS -->
 
@@ -1523,9 +1585,7 @@ input[type="file"] {
 
                         <span class="dropdown-badge">
 
-                            <?php
-                            echo $notification_unread;
-                            ?>
+                            <?php echo $notification_unread; ?>
 
                         </span>
 
@@ -1533,9 +1593,7 @@ input[type="file"] {
 
                 </a>
 
-
                 <div class="dropdown-divider"></div>
-
 
                 <!-- SIGN OUT -->
 
@@ -1554,7 +1612,6 @@ input[type="file"] {
 
                 </a>
 
-
             </div>
 
         </div>
@@ -1563,13 +1620,11 @@ input[type="file"] {
 
 </nav>
 
-
 <!-- =======================================================
      MAIN
 ======================================================= -->
 
 <div class="container">
-
 
     <!-- PAGE HEADER -->
 
@@ -1585,11 +1640,9 @@ input[type="file"] {
 
     </div>
 
-
     <!-- FORM CARD -->
 
     <div class="card">
-
 
         <!-- ERROR -->
 
@@ -1597,16 +1650,11 @@ input[type="file"] {
 
             <div class="error">
 
-                <?php
-                echo htmlspecialchars(
-                    $error
-                );
-                ?>
+                <?php echo e($error); ?>
 
             </div>
 
         <?php endif; ?>
-
 
         <!-- SUCCESS -->
 
@@ -1614,11 +1662,35 @@ input[type="file"] {
 
             <div class="success">
 
-                <?php
-                echo htmlspecialchars(
-                    $success
-                );
-                ?>
+                <?php echo e($success); ?>
+
+                <div class="verification-box">
+
+                    <span class="verification-title">
+                        Your Item Verification Code
+                    </span>
+
+                    <span
+                        class="verification-code"
+                        id="verificationCode"
+                    ><?php echo e($verification_code); ?></span>
+
+                    <button
+                        type="button"
+                        class="copy-code-button"
+                        onclick="copyVerificationCode()"
+                    >
+                        Copy Verification Code
+                    </button>
+
+                    <p class="verification-note">
+                        Keep this code safe. You can also find it in My Reports.
+                        Provide this code to an administrator when asking them
+                        to look up your report. This code identifies your report
+                        but does not serve as proof of item ownership.
+                    </p>
+
+                </div>
 
             </div>
 
@@ -1626,14 +1698,12 @@ input[type="file"] {
 
         <?php endif; ?>
 
-
         <!-- FORM -->
 
         <form
             method="POST"
             enctype="multipart/form-data"
         >
-
 
             <!-- ITEM NAME -->
 
@@ -1648,16 +1718,11 @@ input[type="file"] {
                     id="item_name"
                     name="item_name"
                     placeholder="Example: Black cellphone"
-                    value="<?php
-                        echo htmlspecialchars(
-                            $_POST["item_name"] ?? ""
-                        );
-                    ?>"
+                    value="<?php echo e($_POST["item_name"] ?? ""); ?>"
                     required
                 >
 
             </div>
-
 
             <!-- CATEGORY -->
 
@@ -1676,7 +1741,6 @@ input[type="file"] {
                     <option value="">
                         Select Category
                     </option>
-
 
                     <?php
 
@@ -1699,15 +1763,12 @@ input[type="file"] {
 
                     ];
 
-
                     foreach ($categories as $cat):
 
                     ?>
 
                         <option
-                            value="<?php
-                                echo htmlspecialchars($cat);
-                            ?>"
+                            value="<?php echo e($cat); ?>"
                             <?php
 
                             echo (
@@ -1719,9 +1780,7 @@ input[type="file"] {
                             ?>
                         >
 
-                            <?php
-                            echo htmlspecialchars($cat);
-                            ?>
+                            <?php echo e($cat); ?>
 
                         </option>
 
@@ -1730,7 +1789,6 @@ input[type="file"] {
                 </select>
 
             </div>
-
 
             <!-- DESCRIPTION -->
 
@@ -1745,14 +1803,9 @@ input[type="file"] {
                     name="description"
                     placeholder="Describe the item, including color, design, brand, or other details."
                     required
-                ><?php
-                    echo htmlspecialchars(
-                        $_POST["description"] ?? ""
-                    );
-                ?></textarea>
+                ><?php echo e($_POST["description"] ?? ""); ?></textarea>
 
             </div>
-
 
             <!-- LOCATION -->
 
@@ -1767,16 +1820,11 @@ input[type="file"] {
                     id="location"
                     name="location"
                     placeholder="Example: RTU Library"
-                    value="<?php
-                        echo htmlspecialchars(
-                            $_POST["location"] ?? ""
-                        );
-                    ?>"
+                    value="<?php echo e($_POST["location"] ?? ""); ?>"
                     required
                 >
 
             </div>
-
 
             <!-- DATE -->
 
@@ -1790,16 +1838,11 @@ input[type="file"] {
                     type="date"
                     id="date_reported"
                     name="date_reported"
-                    value="<?php
-                        echo htmlspecialchars(
-                            $_POST["date_reported"] ?? date("Y-m-d")
-                        );
-                    ?>"
+                    value="<?php echo e($_POST["date_reported"] ?? date("Y-m-d")); ?>"
                     required
                 >
 
             </div>
-
 
             <!-- IMAGE -->
 
@@ -1826,7 +1869,6 @@ input[type="file"] {
 
             </div>
 
-
             <!-- AI INFORMATION -->
 
             <div class="ai-info">
@@ -1838,16 +1880,14 @@ input[type="file"] {
                 <p>
                     Your lost-item report will be saved successfully.
                     AI matching can be initiated separately through
-                    the Find Matching Items feature in My Reports.The system uses the newer hybrid AI matching process
+                    the Find Matching Items feature in My Reports.
+                    The system uses the newer hybrid AI matching process
                     to identify potentially matching lost and found items.
                 </p>
 
-
             </div>
 
-
             <br>
-
 
             <!-- SUBMIT -->
 
@@ -1860,15 +1900,11 @@ input[type="file"] {
 
             </button>
 
-
         </form>
-
 
     </div>
 
-
 </div>
-
 
 <script>
 
@@ -1882,7 +1918,6 @@ const profileButton =
 const profileDropdown =
     document.getElementById("profileDropdown");
 
-
 profileButton.addEventListener(
     "click",
     function(event) {
@@ -1895,7 +1930,6 @@ profileButton.addEventListener(
 
     }
 );
-
 
 /* =========================================================
    CLOSE DROPDOWN WHEN CLICKING OUTSIDE
@@ -1919,6 +1953,63 @@ document.addEventListener(
     }
 );
 
+/* =========================================================
+   COPY VERIFICATION CODE
+========================================================= */
+
+function copyVerificationCode() {
+
+    const codeElement =
+        document.getElementById("verificationCode");
+
+    if (!codeElement) {
+        return;
+    }
+
+    const code = codeElement.textContent.trim();
+
+    if (navigator.clipboard && window.isSecureContext) {
+
+        navigator.clipboard.writeText(code)
+            .then(function() {
+
+                alert("Verification code copied successfully.");
+
+            })
+            .catch(function() {
+
+                alert("Unable to copy the code. Please copy it manually.");
+
+            });
+
+    } else {
+
+        const temporaryInput =
+            document.createElement("textarea");
+
+        temporaryInput.value = code;
+
+        document.body.appendChild(temporaryInput);
+
+        temporaryInput.select();
+
+        try {
+
+            document.execCommand("copy");
+
+            alert("Verification code copied successfully.");
+
+        } catch (error) {
+
+            alert("Unable to copy the code. Please copy it manually.");
+
+        }
+
+        document.body.removeChild(temporaryInput);
+
+    }
+
+}
 
 /* =========================================================
    PREVENT BACK/FORWARD CACHE
@@ -1938,7 +2029,6 @@ window.addEventListener(
 );
 
 </script>
-
 
 </body>
 

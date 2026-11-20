@@ -1,3 +1,4 @@
+
 <?php
 
 session_start();
@@ -22,7 +23,11 @@ if (!isset($_SESSION["user_id"])) {
 }
 
 
-require_once "config/database.php";
+/* =========================================================
+   SUPABASE CONNECTION
+========================================================= */
+
+require_once __DIR__ . "/config/supabase.php";
 
 $current_user_id = (int) $_SESSION["user_id"];
 
@@ -31,7 +36,7 @@ $current_user_id = (int) $_SESSION["user_id"];
    CURRENT USER
 ========================================================= */
 
-$user_stmt = $conn->prepare("
+$user_stmt = $supabase->prepare("
     SELECT
         id,
         student_id,
@@ -39,23 +44,15 @@ $user_stmt = $conn->prepare("
         email,
         role
     FROM users
-    WHERE id = ?
+    WHERE id = :user_id
     LIMIT 1
 ");
 
-$user_stmt->bind_param(
-    "i",
-    $current_user_id
-);
+$user_stmt->execute([
+    ":user_id" => $current_user_id
+]);
 
-$user_stmt->execute();
-
-$current_user =
-    $user_stmt
-    ->get_result()
-    ->fetch_assoc();
-
-$user_stmt->close();
+$current_user = $user_stmt->fetch(PDO::FETCH_ASSOC);
 
 
 if (!$current_user) {
@@ -75,31 +72,19 @@ if (!$current_user) {
 
 $my_reports = 0;
 
-$reports_stmt = $conn->prepare("
+$reports_stmt = $supabase->prepare("
     SELECT COUNT(*) AS total
     FROM items
-    WHERE user_id = ?
+    WHERE user_id = :user_id
 ");
 
-if ($reports_stmt) {
+$reports_stmt->execute([
+    ":user_id" => $current_user_id
+]);
 
-    $reports_stmt->bind_param(
-        "i",
-        $current_user_id
-    );
+$reports_result = $reports_stmt->fetch(PDO::FETCH_ASSOC);
 
-    $reports_stmt->execute();
-
-    $reports_result =
-        $reports_stmt
-        ->get_result()
-        ->fetch_assoc();
-
-    $my_reports =
-        (int) $reports_result["total"];
-
-    $reports_stmt->close();
-}
+$my_reports = (int) $reports_result["total"];
 
 
 /* =========================================================
@@ -108,33 +93,20 @@ if ($reports_stmt) {
 
 $total_unread = 0;
 
-$unread_stmt = $conn->prepare("
+$unread_stmt = $supabase->prepare("
     SELECT COUNT(*) AS total_unread
     FROM messages
-    WHERE receiver_id = ?
-    AND is_read = 0
+    WHERE receiver_id = :user_id
+    AND is_read = FALSE
 ");
 
-if ($unread_stmt) {
+$unread_stmt->execute([
+    ":user_id" => $current_user_id
+]);
 
-    $unread_stmt->bind_param(
-        "i",
-        $current_user_id
-    );
+$unread_result = $unread_stmt->fetch(PDO::FETCH_ASSOC);
 
-    $unread_stmt->execute();
-
-    $unread_result =
-        $unread_stmt
-        ->get_result()
-        ->fetch_assoc();
-
-    $total_unread =
-        (int) $unread_result["total_unread"];
-
-    $unread_stmt->close();
-}
-
+$total_unread = (int) $unread_result["total_unread"];
 
 
 /* =========================================================
@@ -143,7 +115,7 @@ if ($unread_stmt) {
 
 $recent_items = [];
 
-$recent_stmt = $conn->prepare("
+$recent_stmt = $supabase->prepare("
     SELECT
         id,
         item_name,
@@ -159,36 +131,24 @@ $recent_stmt = $conn->prepare("
     LIMIT 6
 ");
 
-if ($recent_stmt) {
+$recent_stmt->execute();
 
-    $recent_stmt->execute();
-
-    $recent_items =
-        $recent_stmt
-        ->get_result()
-        ->fetch_all(
-            MYSQLI_ASSOC
-        );
-
-    $recent_stmt->close();
-}
+$recent_items = $recent_stmt->fetchAll(PDO::FETCH_ASSOC);
 
 
 /* =========================================================
    PROFILE INITIAL
 ========================================================= */
 
-$name_for_initial =
-    trim($current_user["name"]);
+$name_for_initial = trim($current_user["name"]);
 
-$profile_initial =
-    strtoupper(
-        substr(
-            $name_for_initial,
-            0,
-            1
-        )
-    );
+$profile_initial = strtoupper(
+    substr(
+        $name_for_initial,
+        0,
+        1
+    )
+);
 
 ?>
 
@@ -760,7 +720,7 @@ body {
 .signout {
 
     color:
-        #b91c1c !important; 
+        #b91c1c !important;
 }
 
 .signout:hover {

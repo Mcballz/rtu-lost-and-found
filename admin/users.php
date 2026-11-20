@@ -1,93 +1,274 @@
+
 <?php
+
 session_start();
+
+/* =========================================================
+   PREVENT BROWSER CACHING
+========================================================= */
 
 header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
 header("Cache-Control: post-check=0, pre-check=0", false);
 header("Pragma: no-cache");
 header("Expires: 0");
 
+/* =========================================================
+   AUTHENTICATION
+========================================================= */
+
 if (!isset($_SESSION["user_id"])) {
     header("Location: ../login.php");
     exit();
 }
 
-require_once "../config/database.php";
+require_once __DIR__ . "/../config/supabase.php";
+
+$user_id = (int) $_SESSION["user_id"];
 
 /* =========================================================
    CHECK ADMIN
 ========================================================= */
 
-$user_id = (int) $_SESSION["user_id"];
+$stmt = $supabase->prepare("
+    SELECT role
+    FROM users
+    WHERE id = :user_id
+");
 
-$stmt = $conn->prepare("SELECT role FROM users WHERE id = ?");
-$stmt->bind_param("i", $user_id);
-$stmt->execute();
+$stmt->execute([
+    "user_id" => $user_id
+]);
 
-$current_user = $stmt->get_result()->fetch_assoc();
-$stmt->close();
+$current_user = $stmt->fetch(PDO::FETCH_ASSOC);
 
 if (!$current_user || $current_user["role"] !== "admin") {
+    http_response_code(403);
     die("Access denied. Admins only.");
 }
+
+/* =========================================================
+   CSRF TOKEN
+========================================================= */
+
+if (empty($_SESSION["users_csrf"])) {
+    $_SESSION["users_csrf"] = bin2hex(random_bytes(32));
+}
+
+$csrf_token = $_SESSION["users_csrf"];
+
+/* =========================================================
+   HELPER FUNCTIONS
+========================================================= */
+
+function redirectUsers($student_id = "")
+{
+    $url = "users.php";
+
+    if ($student_id !== "") {
+        $url .= "?" . http_build_query([
+            "student_id" => $student_id
+        ]);
+    }
+
+    header("Location: " . $url);
+    exit();
+}
+
+function verifyUsersCsrf()
+{
+    $submitted = $_POST["csrf_token"] ?? "";
+    $stored = $_SESSION["users_csrf"] ?? "";
+
+    if (
+        $stored === "" ||
+        !is_string($submitted) ||
+        !hash_equals($stored, $submitted)
+    ) {
+        http_response_code(403);
+        die("Invalid security token. Please refresh the page and try again.");
+    }
+}
+
+/* =========================================================
+   SESSION NOTIFICATIONS
+========================================================= */
+
+$users_error = $_SESSION["users_error"] ?? "";
+$users_success = $_SESSION["users_success"] ?? "";
+
+unset($_SESSION["users_error"], $_SESSION["users_success"]);
 
 /* =========================================================
    DELETE USER
 ========================================================= */
 
-if (isset($_GET["delete"])) {
-    $delete_id = (int) $_GET["delete"];
+if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["delete_user"])) {
 
-    // Prevent an admin from deleting their own account.
-    if ($delete_id > 0 && $delete_id !== $user_id) {
-        $stmt = $conn->prepare("DELETE FROM users WHERE id = ?");
-        $stmt->bind_param("i", $delete_id);
-        $stmt->execute();
-        $stmt->close();
+    verifyUsersCsrf();
+
+    $delete_id = (int) ($_POST["delete_user_id"] ?? 0);
+    $search_id = trim($_POST["search_student_id"] ?? "");
+
+    if ($delete_id <= 0 || $delete_id === $user_id) {
+
+        $_SESSION["users_error"] = "You cannot delete your own administrator account.";
+
+    } else {
+
+        try {
+
+            $stmt = $supabase->prepare("
+                DELETE FROM users
+                WHERE id = :user_id
+            ");
+
+            $stmt->execute([
+                "user_id" => $delete_id
+            ]);
+
+            $_SESSION["users_success"] = "User account deleted successfully.";
+
+        } catch (Throwable $e) {
+
+            error_log("Admin user deletion error: " . $e->getMessage());
+
+            $_SESSION["users_error"] =
+                "Unable to delete this account. It may still be connected to other records.";
+
+        }
+
     }
 
-    header("Location: users.php");
-    exit();
+    redirectUsers($search_id);
 }
 
 /* =========================================================
-   UPDATE USER
+   UPDATE USER INFORMATION
 ========================================================= */
 
 if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["update_user"])) {
+
+    verifyUsersCsrf();
+
     $edit_id = (int) ($_POST["user_id"] ?? 0);
+
     $name = trim($_POST["name"] ?? "");
     $student_id = trim($_POST["student_id"] ?? "");
     $email = trim($_POST["email"] ?? "");
     $role = $_POST["role"] ?? "";
+    $status = $_POST["status"] ?? "";
+
+    $search_id = trim($_POST["search_student_id"] ?? "");
 
     if (
-        $edit_id > 0 &&
-        $name !== "" &&
-        $student_id !== "" &&
-        filter_var($email, FILTER_VALIDATE_EMAIL) &&
-        in_array($role, ["student", "admin"], true)
+        $edit_id <= 0 ||
+        $name === "" ||
+        $student_id === "" ||
+        !filter_var($email, FILTER_VALIDATE_EMAIL) ||
+        !in_array($role, ["student", "admin"], true) ||
+        !in_array($status, ["active", "inactive"], true)
     ) {
-        $stmt = $conn->prepare("
-            UPDATE users
-            SET name = ?, student_id = ?, email = ?, role = ?
-            WHERE id = ?
-        ");
 
-        $stmt->bind_param(
-            "ssssi",
-            $name,
-            $student_id,
-            $email,
-            $role,
-            $edit_id
-        );
+        $_SESSION["users_error"] = "Invalid information. Please check all fields.";
 
-        $stmt->execute();
-        $stmt->close();
+        redirectUsers($search_id);
+
     }
 
-    header("Location: users.php");
-    exit();
+    // Prevent accidental removal of the current administrator's own admin role.
+    if ($edit_id === $user_id && $role !== "admin") {
+
+        $_SESSION["users_error"] =
+            "You cannot remove your own administrator privileges.";
+
+        redirectUsers($search_id);
+
+    }
+
+    try {
+
+        // Check duplicate Student ID.
+        $stmt = $supabase->prepare("
+            SELECT id
+            FROM users
+            WHERE student_id = :student_id
+            AND id <> :user_id
+            LIMIT 1
+        ");
+
+        $stmt->execute([
+            "student_id" => $student_id,
+            "user_id" => $edit_id
+        ]);
+
+        if ($stmt->fetch()) {
+
+            $_SESSION["users_error"] =
+                "That Student ID is already registered.";
+
+            redirectUsers($search_id);
+
+        }
+
+        // Check duplicate email.
+        $stmt = $supabase->prepare("
+            SELECT id
+            FROM users
+            WHERE LOWER(email) = LOWER(:email)
+            AND id <> :user_id
+            LIMIT 1
+        ");
+
+        $stmt->execute([
+            "email" => $email,
+            "user_id" => $edit_id
+        ]);
+
+        if ($stmt->fetch()) {
+
+            $_SESSION["users_error"] =
+                "That email address is already registered.";
+
+            redirectUsers($search_id);
+
+        }
+
+        // Update account.
+        $stmt = $supabase->prepare("
+            UPDATE users
+            SET
+                name = :name,
+                student_id = :student_id,
+                email = :email,
+                role = :role,
+                status = :status
+            WHERE id = :user_id
+        ");
+
+        $stmt->execute([
+            "name" => $name,
+            "student_id" => $student_id,
+            "email" => $email,
+            "role" => $role,
+            "status" => $status,
+            "user_id" => $edit_id
+        ]);
+
+        $_SESSION["users_success"] =
+            "User information updated successfully.";
+
+        redirectUsers($student_id);
+
+    } catch (Throwable $e) {
+
+        error_log("Admin user update error: " . $e->getMessage());
+
+        $_SESSION["users_error"] =
+            "Unable to update user information. Please try again.";
+
+        redirectUsers($search_id);
+
+    }
 }
 
 /* =========================================================
@@ -95,69 +276,146 @@ if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["update_user"])) {
 ========================================================= */
 
 if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["change_password"])) {
+
+    verifyUsersCsrf();
+
     $password_user_id = (int) ($_POST["password_user_id"] ?? 0);
+
     $new_password = $_POST["new_password"] ?? "";
     $confirm_password = $_POST["confirm_password"] ?? "";
 
-    if (
-        $password_user_id > 0 &&
-        $password_user_id !== $user_id &&
-        $new_password !== "" &&
-        $new_password === $confirm_password
-    ) {
-        $hashed_password = password_hash($new_password, PASSWORD_DEFAULT);
+    $search_id = trim($_POST["search_student_id"] ?? "");
 
-        $stmt = $conn->prepare("
-            UPDATE users
-            SET password = ?
-            WHERE id = ?
-        ");
+    if ($password_user_id <= 0 || $password_user_id === $user_id) {
 
-        $stmt->bind_param("si", $hashed_password, $password_user_id);
-        $stmt->execute();
-        $stmt->close();
+        $_SESSION["users_error"] =
+            "Invalid password change request.";
+
+        redirectUsers($search_id);
+
     }
 
-    header("Location: users.php");
-    exit();
+    if (strlen($new_password) < 8) {
+
+        $_SESSION["users_error"] =
+            "The new password must contain at least 8 characters.";
+
+        redirectUsers($search_id);
+
+    }
+
+    if ($new_password !== $confirm_password) {
+
+        $_SESSION["users_error"] =
+            "The new password and confirmation password do not match.";
+
+        redirectUsers($search_id);
+
+    }
+
+    try {
+
+        // Verify that the target user exists.
+        $stmt = $supabase->prepare("
+            SELECT id
+            FROM users
+            WHERE id = :user_id
+        ");
+
+        $stmt->execute([
+            "user_id" => $password_user_id
+        ]);
+
+        if (!$stmt->fetch()) {
+
+            $_SESSION["users_error"] =
+                "The selected user could not be found.";
+
+            redirectUsers($search_id);
+
+        }
+
+        $hashed_password = password_hash(
+            $new_password,
+            PASSWORD_DEFAULT
+        );
+
+        $stmt = $supabase->prepare("
+            UPDATE users
+            SET password = :password
+            WHERE id = :user_id
+        ");
+
+        $stmt->execute([
+            "password" => $hashed_password,
+            "user_id" => $password_user_id
+        ]);
+
+        $_SESSION["users_success"] =
+            "User password changed successfully.";
+
+    } catch (Throwable $e) {
+
+        error_log("Admin password change error: " . $e->getMessage());
+
+        $_SESSION["users_error"] =
+            "Unable to change the user's password.";
+
+    }
+
+    redirectUsers($search_id);
 }
 
 /* =========================================================
-   GET USERS
+   SEARCH USER BY STUDENT ID
 ========================================================= */
 
-$users = $conn->query("
-    SELECT id, student_id, name, email, role, created_at
-    FROM users
-    ORDER BY created_at DESC
-");
+$search_student_id = trim($_GET["student_id"] ?? "");
 
-/* =========================================================
-   SELECT USER FOR EDITING
-========================================================= */
+$found_user = null;
+$edit_mode = isset($_GET["edit"]);
 
-$edit_user = null;
+if ($search_student_id !== "") {
 
-if (isset($_GET["edit"])) {
-    $edit_id = (int) $_GET["edit"];
+    try {
 
-    $stmt = $conn->prepare("
-        SELECT id, student_id, name, email, role
-        FROM users
-        WHERE id = ?
-    ");
+        $stmt = $supabase->prepare("
+            SELECT
+                id,
+                student_id,
+                name,
+                email,
+                role,
+                status,
+                created_at
+            FROM users
+            WHERE student_id = :student_id
+            LIMIT 1
+        ");
 
-    $stmt->bind_param("i", $edit_id);
-    $stmt->execute();
+        $stmt->execute([
+            "student_id" => $search_student_id
+        ]);
 
-    $edit_user = $stmt->get_result()->fetch_assoc();
-    $stmt->close();
+        $found_user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    } catch (Throwable $e) {
+
+        error_log("Student ID search error: " . $e->getMessage());
+
+        $users_error = "Unable to search for this student right now.";
+
+    }
+
 }
+
 ?>
 
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
+
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
@@ -168,14 +426,11 @@ if (isset($_GET["edit"])) {
 <title>Manage Users - RTU Lost and Found</title>
 
 <style>
+
 * {
     box-sizing: border-box;
     margin: 0;
     padding: 0;
-}
-
-html {
-    scroll-behavior: smooth;
 }
 
 body {
@@ -208,14 +463,12 @@ body {
 .brand-text {
     display: flex;
     flex-direction: column;
-    gap: 0px;
 }
 
 .brand-title {
     color: #fff;
     font-size: 20px;
     font-weight: bold;
-    white-space: nowrap;
 }
 
 .brand-subtitle {
@@ -229,7 +482,6 @@ body {
     width: 46px;
     height: 46px;
     object-fit: contain;
-    flex-shrink: 0;
 }
 
 /* ADMIN NAVIGATION */
@@ -270,11 +522,11 @@ body {
     border-bottom: 3px solid #d4af37;
 }
 
-/* MAIN CONTAINER */
+/* MAIN */
 
 .container {
     width: 92%;
-    max-width: 1200px;
+    max-width: 1100px;
     margin: 28px auto 50px;
 }
 
@@ -286,7 +538,7 @@ body {
     border-radius: 16px;
     margin-bottom: 25px;
     border-top: 4px solid #d4af37;
-    box-shadow: 0 3px 14px rgba(0, 0, 0, 0.07);
+    box-shadow: 0 3px 14px rgba(0,0,0,0.07);
 }
 
 .page-header h1 {
@@ -301,26 +553,106 @@ body {
     line-height: 1.6;
 }
 
-/* FORM CARD */
+/* CARDS */
 
-.form-card,
-.table-card {
+.search-card,
+.profile-card,
+.form-card {
     background: white;
     padding: 26px;
     border-radius: 14px;
     border-top: 3px solid #d4af37;
-    box-shadow: 0 3px 14px rgba(0, 0, 0, 0.06);
-}
-
-.form-card {
+    box-shadow: 0 3px 14px rgba(0,0,0,0.06);
     margin-bottom: 25px;
 }
 
-.form-card h2,
-.table-card h2 {
+.search-card h2,
+.profile-card h2,
+.form-card h2 {
     color: #0f2f5f;
     font-size: 21px;
-    margin-bottom: 20px;
+    margin-bottom: 18px;
+}
+
+/* SEARCH */
+
+.search-form {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.search-form input {
+    flex: 1;
+    min-width: 220px;
+    padding: 13px 14px;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    font-size: 15px;
+}
+
+.search-form input:focus {
+    outline: none;
+    border-color: #0f2f5f;
+    box-shadow: 0 0 0 3px rgba(15,47,95,0.10);
+}
+
+.search-button {
+    background: #0f2f5f;
+    padding: 13px 24px;
+}
+
+.search-button:hover {
+    background: #164a8a;
+}
+
+/* PROFILE */
+
+.profile-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 15px;
+    flex-wrap: wrap;
+    margin-bottom: 22px;
+}
+
+.profile-heading h2 {
+    margin-bottom: 5px;
+}
+
+.profile-heading p {
+    color: #64748b;
+    font-size: 13px;
+}
+
+.profile-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+}
+
+.profile-field {
+    padding: 16px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 9px;
+}
+
+.profile-field label {
+    display: block;
+    color: #64748b;
+    font-size: 11px;
+    font-weight: bold;
+    text-transform: uppercase;
+    margin-bottom: 7px;
+}
+
+.profile-field p {
+    color: #1e293b;
+    font-size: 14px;
+    font-weight: 600;
+    overflow-wrap: anywhere;
 }
 
 /* FORM FIELDS */
@@ -352,14 +684,7 @@ body {
 .form-group select:focus {
     outline: none;
     border-color: #0f2f5f;
-    box-shadow: 0 0 0 3px rgba(15, 47, 95, 0.10);
-}
-
-.form-actions {
-    display: flex;
-    gap: 10px;
-    margin-top: 20px;
-    flex-wrap: wrap;
+    box-shadow: 0 0 0 3px rgba(15,47,95,0.10);
 }
 
 /* BUTTONS */
@@ -379,15 +704,21 @@ button,
     transition: 0.18s ease;
 }
 
+button:hover,
+.button:hover {
+    transform: translateY(-1px);
+}
+
+.search-button,
 .save,
 .edit {
     background: #0f2f5f;
 }
 
+.search-button:hover,
 .save:hover,
 .edit:hover {
     background: #164a8a;
-    transform: translateY(-1px);
 }
 
 .cancel {
@@ -414,40 +745,36 @@ button,
     background: #b91c1c;
 }
 
-/* TABLE */
-
-.table-card {
-    overflow-x: auto;
+.form-actions,
+.profile-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 20px;
 }
 
-table {
-    width: 100%;
-    border-collapse: collapse;
-    min-width: 900px;
-}
+/* STATUS */
 
-th,
-td {
-    padding: 14px 13px;
-    border-bottom: 1px solid #e5e7eb;
-    text-align: left;
-    font-size: 13px;
-    vertical-align: top;
-}
-
-th {
-    background: #f8fafc;
-    color: #334155;
-    font-size: 12px;
+.status {
+    display: inline-block;
+    padding: 6px 11px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: bold;
     text-transform: uppercase;
-    letter-spacing: 0.3px;
 }
 
-tbody tr:hover td {
-    background: #f8fbff;
+.status-active {
+    background: #dcfce7;
+    color: #166534;
+    border: 1px solid #86efac;
 }
 
-/* ROLE BADGES */
+.status-inactive {
+    background: #fee2e2;
+    color: #991b1b;
+    border: 1px solid #fca5a5;
+}
 
 .role {
     display: inline-block;
@@ -469,59 +796,48 @@ tbody tr:hover td {
     border: 1px solid #c5d9f5;
 }
 
-/* USER ACTIONS */
-
-.actions {
-    display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
-    margin-bottom: 12px;
-}
-
-.self {
-    display: inline-block;
-    color: #64748b;
-    font-size: 11px;
-    font-weight: 600;
-    padding: 5px 8px;
-    background: #f1f5f9;
-    border-radius: 6px;
-}
-
 /* PASSWORD CARD */
 
 .password-card {
     background: #f8fafc;
     border: 1px solid #e2e8f0;
-    padding: 17px;
-    margin-top: 12px;
+    padding: 20px;
     border-radius: 10px;
-    min-width: 230px;
+    margin-top: 20px;
 }
 
 .password-card h3 {
     color: #334155;
+    font-size: 16px;
+    margin-bottom: 16px;
+}
+
+/* ALERTS */
+
+.alert {
+    padding: 14px 18px;
+    margin-bottom: 20px;
+    border-radius: 9px;
     font-size: 14px;
-    margin-bottom: 15px;
+    line-height: 1.5;
 }
 
-.password-card .form-group {
-    margin-bottom: 12px;
+.alert-error {
+    background: #fee2e2;
+    border: 1px solid #fca5a5;
+    color: #991b1b;
 }
 
-.password-card .form-group label {
-    font-size: 12px;
-}
-
-.password-card .form-group input {
-    padding: 9px 10px;
-    font-size: 13px;
+.alert-success {
+    background: #dcfce7;
+    border: 1px solid #86efac;
+    color: #166534;
 }
 
 /* EMPTY STATE */
 
 .empty {
-    padding: 45px 25px;
+    padding: 35px 25px;
     text-align: center;
     color: #64748b;
     background: #f8fafc;
@@ -530,35 +846,18 @@ tbody tr:hover td {
     font-size: 14px;
 }
 
-/* RESPONSIVE */
-
-@media (max-width: 850px) {
-    .navbar {
-        padding: 12px 4%;
-    }
-
-    .admin-nav {
-        padding: 10px 4%;
-    }
-
-    .admin-nav a {
-        font-size: 13px;
-        padding: 8px 10px;
-    }
-
-    .container {
-        width: 94%;
-        margin-top: 24px;
-    }
-
-    .admin-nav .user-dashboard {
-        margin-left: 0;
-    }
+.empty h3 {
+    color: #334155;
+    margin-bottom: 8px;
+    font-size: 17px;
 }
 
-@media (max-width: 600px) {
+/* RESPONSIVE */
+
+@media (max-width: 650px) {
+
     .navbar {
-        gap: 12px;
+        padding: 12px 4%;
     }
 
     .brand-title {
@@ -570,22 +869,18 @@ tbody tr:hover td {
         height: 42px;
     }
 
-    .profile-name {
-        display: none;
-    }
-
     .admin-nav {
-        gap: 5px;
+        padding: 10px 4%;
     }
 
-    .admin-nav a {
-        padding: 8px 9px;
-        font-size: 12px;
+    .container {
+        width: 94%;
     }
 
     .page-header,
-    .form-card,
-    .table-card {
+    .search-card,
+    .profile-card,
+    .form-card {
         padding: 20px;
     }
 
@@ -593,35 +888,48 @@ tbody tr:hover td {
         font-size: 23px;
     }
 
-    .form-actions {
+    .profile-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .search-form {
         flex-direction: column;
     }
 
-    .form-actions .button,
-    .form-actions button {
+    .search-form input,
+    .search-form button {
+        width: 100%;
+    }
+
+    .form-actions,
+    .profile-actions {
+        flex-direction: column;
+    }
+
+    .form-actions button,
+    .form-actions a,
+    .profile-actions button,
+    .profile-actions a {
         width: 100%;
     }
 }
 
-/* PRINT */
-
 @media print {
     .navbar,
     .admin-nav,
-    .form-card {
+    .search-card,
+    .form-card,
+    .profile-actions {
         display: none;
     }
 
     body {
         background: white;
     }
-
-    .table-card {
-        box-shadow: none;
-        border: 1px solid #ddd;
-    }
 }
+
 </style>
+
 </head>
 
 <body>
@@ -650,276 +958,472 @@ tbody tr:hover td {
 <nav class="admin-nav">
 
     <a href="items.php">Manage Items</a>
-    <a href="claims.php">Manage Claims</a>
     <a href="users.php" class="active">Users</a>
-    <a href="ai_matches.php">AI Matches</a>
 
 </nav>
-
-<!-- MAIN CONTENT -->
 
 <main class="container">
 
     <section class="page-header">
+
         <h1>Manage Users</h1>
-        <p>View and manage registered users and administrator accounts.</p>
+
+        <p>
+            Search for registered student accounts using their Student ID.
+            View profiles and manage account information.
+        </p>
+
     </section>
 
-    <!-- EDIT USER -->
+    <?php if ($users_error !== ""): ?>
 
-    <?php if ($edit_user): ?>
+        <div class="alert alert-error">
+            <?php echo htmlspecialchars($users_error); ?>
+        </div>
 
-        <section class="form-card">
+    <?php endif; ?>
 
-            <h2>Edit User</h2>
+    <?php if ($users_success !== ""): ?>
 
-            <form method="POST" action="users.php">
+        <div class="alert alert-success">
+            <?php echo htmlspecialchars($users_success); ?>
+        </div>
 
-                <input
-                    type="hidden"
-                    name="user_id"
-                    value="<?php echo (int) $edit_user["id"]; ?>"
-                >
+    <?php endif; ?>
 
-                <div class="form-group">
-                    <label for="name">Name</label>
-                    <input
-                        type="text"
-                        id="name"
-                        name="name"
-                        value="<?php echo htmlspecialchars($edit_user["name"]); ?>"
-                        required
-                    >
-                </div>
+    <!-- STUDENT ID SEARCH -->
 
-                <div class="form-group">
-                    <label for="student_id">Student ID</label>
-                    <input
-                        type="text"
-                        id="student_id"
-                        name="student_id"
-                        value="<?php echo htmlspecialchars($edit_user["student_id"]); ?>"
-                        required
-                    >
-                </div>
+    <section class="search-card">
 
-                <div class="form-group">
-                    <label for="email">Email</label>
-                    <input
-                        type="email"
-                        id="email"
-                        name="email"
-                        value="<?php echo htmlspecialchars($edit_user["email"]); ?>"
-                        required
-                    >
-                </div>
+        <h2>Search Student Account</h2>
 
-                <div class="form-group">
-                    <label for="role">Role</label>
-                    <select id="role" name="role" required>
-                        <option
-                            value="student"
-                            <?php echo $edit_user["role"] === "student" ? "selected" : ""; ?>
-                        >
-                            Student
-                        </option>
+        <form method="GET" action="users.php" class="search-form">
 
-                        <option
-                            value="admin"
-                            <?php echo $edit_user["role"] === "admin" ? "selected" : ""; ?>
-                        >
-                            Admin
-                        </option>
-                    </select>
-                </div>
+            <input
+                type="text"
+                name="student_id"
+                placeholder="Enter Student ID"
+                value="<?php echo htmlspecialchars($search_student_id); ?>"
+                required
+                autocomplete="off"
+            >
 
-                <div class="form-actions">
-                    <button type="submit" name="update_user" class="save">
-                        Save Changes
-                    </button>
+            <button type="submit" class="search-button">
+                Search Student
+            </button>
 
-                    <a href="users.php" class="button cancel">
-                        Cancel
-                    </a>
-                </div>
+        </form>
 
-            </form>
+    </section>
+
+    <!-- SEARCH RESULT -->
+
+    <?php if ($search_student_id !== "" && !$found_user): ?>
+
+        <section class="profile-card">
+
+            <div class="empty">
+
+                <h3>No Student Found</h3>
+
+                No account matches Student ID:
+                <strong>
+                    <?php echo htmlspecialchars($search_student_id); ?>
+                </strong>
+
+                <p style="margin-top: 10px;">
+                    Please check the Student ID and search again.
+                </p>
+
+            </div>
 
         </section>
 
     <?php endif; ?>
 
-    <!-- REGISTERED USERS -->
+    <?php if ($found_user): ?>
 
-    <section class="table-card">
+        <?php if ($edit_mode): ?>
 
-        <h2>Registered Users</h2>
+            <!-- EDIT PROFILE -->
 
-        <?php if ($users && $users->num_rows > 0): ?>
+            <section class="form-card">
 
-            <table>
+                <h2>Edit User Information</h2>
 
-                <thead>
-                    <tr>
-                        <th>ID</th>
-                        <th>Name</th>
-                        <th>Student ID</th>
-                        <th>Email</th>
-                        <th>Role</th>
-                        <th>Date Registered</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
+                <form method="POST" action="users.php">
 
-                <tbody>
+                    <input type="hidden" name="csrf_token"
+                        value="<?php echo htmlspecialchars($csrf_token); ?>">
 
-                    <?php while ($row = $users->fetch_assoc()): ?>
+                    <input type="hidden" name="user_id"
+                        value="<?php echo (int) $found_user["id"]; ?>">
 
-                        <tr>
+                    <input type="hidden" name="search_student_id"
+                        value="<?php echo htmlspecialchars($search_student_id); ?>">
 
-                            <td><?php echo (int) $row["id"]; ?></td>
+                    <div class="form-group">
 
-                            <td>
-                                <?php echo htmlspecialchars($row["name"]); ?>
-                            </td>
+                        <label for="name">Full Name</label>
 
-                            <td>
-                                <?php echo htmlspecialchars($row["student_id"]); ?>
-                            </td>
+                        <input
+                            type="text"
+                            id="name"
+                            name="name"
+                            value="<?php echo htmlspecialchars($found_user["name"] ?? ""); ?>"
+                            required
+                        >
 
-                            <td>
-                                <?php echo htmlspecialchars($row["email"]); ?>
-                            </td>
+                    </div>
 
-                            <td>
-                                <span class="role role-<?php echo htmlspecialchars($row["role"]); ?>">
-                                    <?php echo htmlspecialchars(ucfirst($row["role"])); ?>
-                                </span>
-                            </td>
+                    <div class="form-group">
 
-                            <td>
-                                <?php echo htmlspecialchars($row["created_at"]); ?>
-                            </td>
+                        <label for="student_id">Student ID</label>
 
-                            <td>
+                        <input
+                            type="text"
+                            id="student_id"
+                            name="student_id"
+                            value="<?php echo htmlspecialchars($found_user["student_id"] ?? ""); ?>"
+                            required
+                        >
 
-                                <div class="actions">
+                    </div>
 
-                                    <a
-                                        href="users.php?edit=<?php echo (int) $row["id"]; ?>"
-                                        class="button edit"
-                                    >
-                                        Edit
-                                    </a>
+                    <div class="form-group">
 
-                                    <?php if ((int) $row["id"] !== $user_id): ?>
+                        <label for="email">Email Address</label>
 
-                                        <a
-                                            href="users.php?delete=<?php echo (int) $row["id"]; ?>"
-                                            class="button delete"
-                                            onclick="return confirm('Are you sure you want to delete this user? This action cannot be undone.');"
-                                        >
-                                            Delete
-                                        </a>
+                        <input
+                            type="email"
+                            id="email"
+                            name="email"
+                            value="<?php echo htmlspecialchars($found_user["email"] ?? ""); ?>"
+                            required
+                        >
 
-                                    <?php else: ?>
+                    </div>
 
-                                        <span class="self">Current Account</span>
+                    <div class="form-group">
 
-                                    <?php endif; ?>
+                        <label for="role">Account Role</label>
 
-                                </div>
+                        <select id="role" name="role" required>
 
-                                <?php if ((int) $row["id"] !== $user_id): ?>
+                            <option value="student"
+                                <?php echo $found_user["role"] === "student" ? "selected" : ""; ?>>
+                                Student
+                            </option>
 
-                                    <div class="password-card">
+                            <option value="admin"
+                                <?php echo $found_user["role"] === "admin" ? "selected" : ""; ?>>
+                                Administrator
+                            </option>
 
-                                        <h3>Change Password</h3>
+                        </select>
 
-                                        <form method="POST" action="users.php">
+                    </div>
 
-                                            <input
-                                                type="hidden"
-                                                name="password_user_id"
-                                                value="<?php echo (int) $row["id"]; ?>"
-                                            >
+                    <div class="form-group">
 
-                                            <div class="form-group">
-                                                <label>New Password</label>
-                                                <input
-                                                    type="password"
-                                                    name="new_password"
-                                                    autocomplete="new-password"
-                                                    required
-                                                >
-                                            </div>
+                        <label for="status">Account Status</label>
 
-                                            <div class="form-group">
-                                                <label>Confirm Password</label>
-                                                <input
-                                                    type="password"
-                                                    name="confirm_password"
-                                                    autocomplete="new-password"
-                                                    required
-                                                >
-                                            </div>
+                        <select id="status" name="status" required>
 
-                                            <button
-                                                type="submit"
-                                                name="change_password"
-                                                class="button password"
-                                                onclick="return confirm('Change this user password?');"
-                                            >
-                                                Change Password
-                                            </button>
+                            <option value="active"
+                                <?php echo $found_user["status"] === "active" ? "selected" : ""; ?>>
+                                Active
+                            </option>
 
-                                        </form>
+                            <option value="inactive"
+                                <?php echo $found_user["status"] === "inactive" ? "selected" : ""; ?>>
+                                Inactive
+                            </option>
 
-                                    </div>
+                        </select>
 
-                                <?php endif; ?>
+                    </div>
 
-                            </td>
+                    <div class="form-actions">
 
-                        </tr>
+                        <button
+                            type="submit"
+                            name="update_user"
+                            class="save"
+                        >
+                            Save Changes
+                        </button>
 
-                    <?php endwhile; ?>
+                        <a
+                            href="users.php?student_id=<?php echo urlencode($search_student_id); ?>"
+                            class="button cancel"
+                        >
+                            Cancel
+                        </a>
 
-                </tbody>
+                    </div>
 
-            </table>
+                </form>
+
+            </section>
 
         <?php else: ?>
 
-            <div class="empty">
-                No registered users found.
-            </div>
+            <!-- USER PROFILE -->
+
+            <section class="profile-card">
+
+                <div class="profile-heading">
+
+                    <div>
+
+                        <h2>Student Profile</h2>
+
+                        <p>
+                            Account information retrieved from Supabase.
+                        </p>
+
+                    </div>
+
+                    <span class="status status-<?php echo htmlspecialchars($found_user["status"]); ?>">
+                        <?php echo htmlspecialchars(ucfirst($found_user["status"])); ?>
+                    </span>
+
+                </div>
+
+                <div class="profile-grid">
+
+                    <div class="profile-field">
+
+                        <label>Database User ID</label>
+
+                        <p>
+                            <?php echo (int) $found_user["id"]; ?>
+                        </p>
+
+                    </div>
+
+                    <div class="profile-field">
+
+                        <label>Student ID</label>
+
+                        <p>
+                            <?php echo htmlspecialchars($found_user["student_id"]); ?>
+                        </p>
+
+                    </div>
+
+                    <div class="profile-field">
+
+                        <label>Full Name</label>
+
+                        <p>
+                            <?php echo htmlspecialchars($found_user["name"]); ?>
+                        </p>
+
+                    </div>
+
+                    <div class="profile-field">
+
+                        <label>Email Address</label>
+
+                        <p>
+                            <?php echo htmlspecialchars($found_user["email"]); ?>
+                        </p>
+
+                    </div>
+
+                    <div class="profile-field">
+
+                        <label>Account Role</label>
+
+                        <p>
+                            <span class="role role-<?php echo htmlspecialchars($found_user["role"]); ?>">
+                                <?php echo htmlspecialchars(ucfirst($found_user["role"])); ?>
+                            </span>
+                        </p>
+
+                    </div>
+
+                    <div class="profile-field">
+
+                        <label>Account Status</label>
+
+                        <p>
+                            <?php echo htmlspecialchars(ucfirst($found_user["status"])); ?>
+                        </p>
+
+                    </div>
+
+                    <div class="profile-field">
+
+                        <label>Date Registered</label>
+
+                        <p>
+                            <?php echo htmlspecialchars($found_user["created_at"] ?? "Not available"); ?>
+                        </p>
+
+                    </div>
+
+                </div>
+
+                <div class="profile-actions">
+
+                    <a
+                        href="users.php?student_id=<?php echo urlencode($search_student_id); ?>&edit=1"
+                        class="button edit"
+                    >
+                        Edit Profile
+                    </a>
+
+                    <?php if ((int) $found_user["id"] !== $user_id): ?>
+
+                        <form method="POST" action="users.php"
+                            onsubmit="return confirm('Are you sure you want to delete this account? This action cannot be undone.');">
+
+                            <input type="hidden" name="csrf_token"
+                                value="<?php echo htmlspecialchars($csrf_token); ?>">
+
+                            <input type="hidden" name="delete_user_id"
+                                value="<?php echo (int) $found_user["id"]; ?>">
+
+                            <input type="hidden" name="search_student_id"
+                                value="<?php echo htmlspecialchars($search_student_id); ?>">
+
+                            <button type="submit" name="delete_user" class="delete">
+                                Delete Account
+                            </button>
+
+                        </form>
+
+                    <?php endif; ?>
+
+                </div>
+
+            </section>
+
+            <!-- CHANGE PASSWORD -->
+
+            <?php if ((int) $found_user["id"] !== $user_id): ?>
+
+                <section class="form-card">
+
+                    <div class="password-card">
+
+                        <h3>Change Student Password</h3>
+
+                        <form method="POST" action="users.php">
+
+                            <input type="hidden" name="csrf_token"
+                                value="<?php echo htmlspecialchars($csrf_token); ?>">
+
+                            <input type="hidden" name="password_user_id"
+                                value="<?php echo (int) $found_user["id"]; ?>">
+
+                            <input type="hidden" name="search_student_id"
+                                value="<?php echo htmlspecialchars($search_student_id); ?>">
+
+                            <div class="form-group">
+
+                                <label for="new_password">
+                                    New Password
+                                </label>
+
+                                <input
+                                    type="password"
+                                    id="new_password"
+                                    name="new_password"
+                                    minlength="8"
+                                    autocomplete="new-password"
+                                    required
+                                >
+
+                            </div>
+
+                            <div class="form-group">
+
+                                <label for="confirm_password">
+                                    Confirm New Password
+                                </label>
+
+                                <input
+                                    type="password"
+                                    id="confirm_password"
+                                    name="confirm_password"
+                                    minlength="8"
+                                    autocomplete="new-password"
+                                    required
+                                >
+
+                            </div>
+
+                            <button
+                                type="submit"
+                                name="change_password"
+                                class="password"
+                                onclick="return confirm('Are you sure you want to change this student password?');"
+                            >
+                                Change Password
+                            </button>
+
+                        </form>
+
+                    </div>
+
+                </section>
+
+            <?php endif; ?>
 
         <?php endif; ?>
 
-    </section>
+    <?php endif; ?>
 
 </main>
 
 <script>
-const profileMenu = document.getElementById("profileMenu");
-const profileButton = document.getElementById("profileButton");
 
-profileButton.addEventListener("click", function () {
-    profileMenu.classList.toggle("open");
-});
+/* PREVENT BACK/FORWARD CACHE */
 
-document.addEventListener("click", function (event) {
-    if (!profileMenu.contains(event.target)) {
-        profileMenu.classList.remove("open");
-    }
-});
+window.addEventListener("pageshow", function(event) {
 
-window.addEventListener("pageshow", function (event) {
     if (event.persisted) {
         window.location.reload();
     }
+
 });
+
+/* PASSWORD CONFIRMATION */
+
+const passwordForm = document.querySelector(
+    'form input[name="new_password"]'
+);
+
+if (passwordForm) {
+
+    const form = passwordForm.closest("form");
+
+    form.addEventListener("submit", function(event) {
+
+        const password = form.querySelector(
+            '[name="new_password"]'
+        ).value;
+
+        const confirmPassword = form.querySelector(
+            '[name="confirm_password"]'
+        ).value;
+
+        if (password !== confirmPassword) {
+
+            event.preventDefault();
+
+            alert("The passwords do not match.");
+
+        }
+
+    });
+
+}
+
 </script>
 
 </body>

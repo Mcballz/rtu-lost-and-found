@@ -1,12 +1,40 @@
+
 <?php
 
 session_start();
 
-require_once "config/database.php";
+/* =====================================================
+   PREVENT BROWSER CACHE
+===================================================== */
+
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+header("Cache-Control: post-check=0, pre-check=0", false);
+header("Pragma: no-cache");
+header("Expires: 0");
+
+/* =====================================================
+   SUPABASE CONNECTION
+===================================================== */
 
 $message = "";
 
-if ($_SERVER["REQUEST_METHOD"] == "POST") {
+try {
+
+    require_once __DIR__ . "/config/supabase.php";
+
+} catch (Throwable $e) {
+
+    error_log("Supabase Connection Error: " . $e->getMessage());
+
+    $message = "Unable to connect to the database. Please try again later.";
+
+}
+
+/* =====================================================
+   LOGIN PROCESS
+===================================================== */
+
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
     $email = trim($_POST["email"] ?? "");
     $password = $_POST["password"] ?? "";
@@ -15,52 +43,54 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
         $message = "Please enter your email and password.";
 
+    } elseif (!isset($supabase) || !$supabase instanceof PDO) {
+
+        $message = "Unable to connect to the database. Please try again later.";
+
     } else {
 
-        $sql = "SELECT id, student_id, name, email, password, role
-                FROM users
-                WHERE email = ?";
+        try {
 
-        $stmt = $conn->prepare($sql);
+            $sql = "SELECT
+                        id,
+                        student_id,
+                        name,
+                        email,
+                        password,
+                        role
+                    FROM public.users
+                    WHERE email = :email
+                    LIMIT 1";
 
-        if ($stmt) {
+            $stmt = $supabase->prepare($sql);
 
-            $stmt->bind_param("s", $email);
+            $stmt->execute([
+                ":email" => $email
+            ]);
 
-            $stmt->execute();
+            $user = $stmt->fetch();
 
-            $result = $stmt->get_result();
+            if ($user && password_verify($password, $user["password"])) {
 
-            if ($result->num_rows == 1) {
+                session_regenerate_id(true);
 
-                $user = $result->fetch_assoc();
+                $_SESSION["user_id"] = $user["id"];
+                $_SESSION["student_id"] = $user["student_id"];
+                $_SESSION["name"] = $user["name"];
+                $_SESSION["email"] = $user["email"];
+                $_SESSION["role"] = $user["role"];
 
-                if (password_verify($password, $user["password"])) {
+                if ($user["role"] === "admin") {
 
-                    $_SESSION["user_id"] = $user["id"];
-                    $_SESSION["student_id"] = $user["student_id"];
-                    $_SESSION["name"] = $user["name"];
-                    $_SESSION["email"] = $user["email"];
-                    $_SESSION["role"] = $user["role"];
-
-                    // Redirect based on account role
-                    if ($user["role"] === "admin") {
-
-                        header("Location: admin/dashboard.php");
-
-                    } else {
-
-                        header("Location: dashboard.php");
-
-                    }
-
-                    exit();
+                    header("Location: admin/dashboard.php");
 
                 } else {
 
-                    $message = "Invalid email or password.";
+                    header("Location: dashboard.php");
 
                 }
+
+                exit();
 
             } else {
 
@@ -68,14 +98,16 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
             }
 
-            $stmt->close();
+        } catch (Throwable $e) {
 
-        } else {
+            error_log("Supabase Login Error: " . $e->getMessage());
 
-            $message = "Unable to process login.";
+            $message = "Unable to process login. Please try again.";
 
         }
+
     }
+
 }
 
 ?>
@@ -130,10 +162,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             color: #1f2937;
         }
 
-
-        /* =====================================================
-           MAIN CONTAINER
-        ===================================================== */
+        /* MAIN CONTAINER */
 
         .login-container {
 
@@ -158,10 +187,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                 rgba(0, 0, 0, 0.25);
         }
 
-
-        /* =====================================================
-           LEFT SIDE
-        ===================================================== */
+        /* LEFT SIDE */
 
         .login-left {
 
@@ -189,7 +215,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             position: relative;
         }
 
-
         .login-left::before {
 
             content: "";
@@ -209,7 +234,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
             left: -100px;
         }
-
 
         .login-left::after {
 
@@ -231,10 +255,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             right: -90px;
         }
 
-
-        /* =====================================================
-           LOGO
-        ===================================================== */
+        /* LOGO */
 
         .logo-wrapper {
 
@@ -268,7 +289,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             z-index: 2;
         }
 
-
         .logo-wrapper img {
 
             width: 100%;
@@ -277,7 +297,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
             object-fit: contain;
         }
-
 
         .login-left h1 {
 
@@ -292,12 +311,10 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             z-index: 2;
         }
 
-
         .gold-text {
 
             color: #F5C242;
         }
-
 
         .login-left p {
 
@@ -316,7 +333,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             z-index: 2;
         }
 
-
         .gold-line {
 
             width: 80px;
@@ -334,10 +350,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             z-index: 2;
         }
 
-
-        /* =====================================================
-           RIGHT SIDE
-        ===================================================== */
+        /* RIGHT SIDE */
 
         .login-right {
 
@@ -350,12 +363,10 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             justify-content: center;
         }
 
-
         .login-header {
 
             margin-bottom: 28px;
         }
-
 
         .login-header h2 {
 
@@ -366,7 +377,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             color: #002B73;
         }
 
-
         .login-header p {
 
             margin: 0;
@@ -376,10 +386,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             font-size: 14px;
         }
 
-
-        /* =====================================================
-           ERROR MESSAGE
-        ===================================================== */
+        /* ERROR MESSAGE */
 
         .error-message {
 
@@ -401,16 +408,12 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             font-weight: 600;
         }
 
-
-        /* =====================================================
-           FORM
-        ===================================================== */
+        /* FORM */
 
         .form-group {
 
             margin-bottom: 20px;
         }
-
 
         .form-group label {
 
@@ -425,12 +428,10 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             color: #374151;
         }
 
-
         .input-wrapper {
 
             position: relative;
         }
-
 
         .input-icon {
 
@@ -449,7 +450,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
             pointer-events: none;
         }
-
 
         .form-group input {
 
@@ -476,7 +476,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             background: #fff;
         }
 
-
         .form-group input:focus {
 
             border-color: #003DA5;
@@ -486,10 +485,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                 rgba(0, 61, 165, 0.12);
         }
 
-
-        /* =====================================================
-           LOGIN BUTTON
-        ===================================================== */
+        /* LOGIN BUTTON */
 
         .login-button {
 
@@ -525,7 +521,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                 rgba(0, 43, 115, 0.25);
         }
 
-
         .login-button:hover {
 
             transform:
@@ -536,17 +531,13 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                 rgba(0, 43, 115, 0.3);
         }
 
-
         .login-button:active {
 
             transform:
                 translateY(0);
         }
 
-
-        /* =====================================================
-           LINKS
-        ===================================================== */
+        /* LINKS */
 
         .register-link {
 
@@ -559,7 +550,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             color: #6b7280;
         }
 
-
         .register-link a {
 
             color: #003DA5;
@@ -569,7 +559,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             text-decoration: none;
         }
 
-
         .register-link a:hover {
 
             color: #F0B900;
@@ -577,36 +566,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             text-decoration: underline;
         }
 
-
-        .home-link {
-
-            text-align: center;
-
-            margin-top: 18px;
-        }
-
-
-        .home-link a {
-
-            color: #6b7280;
-
-            text-decoration: none;
-
-            font-size: 13px;
-
-            font-weight: 600;
-        }
-
-
-        .home-link a:hover {
-
-            color: #003DA5;
-        }
-
-
-        /* =====================================================
-           GOLD ACCENT
-        ===================================================== */
+        /* GOLD ACCENT */
 
         .gold-accent {
 
@@ -623,10 +583,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             left: 0;
         }
 
-
-        /* =====================================================
-           RESPONSIVE
-        ===================================================== */
+        /* RESPONSIVE */
 
         @media (max-width: 800px) {
 
@@ -635,7 +592,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                 padding: 15px;
             }
 
-
             .login-container {
 
                 grid-template-columns: 1fr;
@@ -643,14 +599,12 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                 max-width: 500px;
             }
 
-
             .login-left {
 
                 min-height: 320px;
 
                 padding: 35px 25px;
             }
-
 
             .logo-wrapper {
 
@@ -663,25 +617,21 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                 margin-bottom: 18px;
             }
 
-
             .login-left h1 {
 
                 font-size: 23px;
             }
-
 
             .login-left p {
 
                 font-size: 13px;
             }
 
-
             .login-right {
 
                 padding: 40px 30px;
             }
         }
-
 
         @media (max-width: 450px) {
 
@@ -690,7 +640,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                 padding:
                     35px 20px;
             }
-
 
             .login-header h2 {
 
@@ -702,21 +651,15 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
 </head>
 
-
 <body>
-
 
 <div class="login-container">
 
-
-    <!-- =====================================================
-         LEFT SIDE
-    ====================================================== -->
+    <!-- LEFT SIDE -->
 
     <div class="login-left">
 
         <div class="gold-accent"></div>
-
 
         <div class="logo-wrapper">
 
@@ -727,7 +670,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
         </div>
 
-
         <h1>
 
             RTU
@@ -737,9 +679,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
         </h1>
 
-
         <div class="gold-line"></div>
-
 
         <p>
 
@@ -751,13 +691,9 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
     </div>
 
-
-    <!-- =====================================================
-         RIGHT SIDE
-    ====================================================== -->
+    <!-- RIGHT SIDE -->
 
     <div class="login-right">
-
 
         <div class="login-header">
 
@@ -771,7 +707,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
         </div>
 
-
         <?php if (!empty($message)): ?>
 
             <div class="error-message">
@@ -784,12 +719,10 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
         <?php endif; ?>
 
-
         <form
             method="POST"
             autocomplete="on"
         >
-
 
             <!-- EMAIL -->
 
@@ -799,11 +732,9 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                     Email Address
                 </label>
 
-
                 <div class="input-wrapper">
 
                     <span class="input-icon"></span>
-
 
                     <input
                         type="email"
@@ -823,7 +754,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
             </div>
 
-
             <!-- PASSWORD -->
 
             <div class="form-group">
@@ -832,11 +762,9 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                     Password
                 </label>
 
-
                 <div class="input-wrapper">
 
                     <span class="input-icon"></span>
-
 
                     <input
                         type="password"
@@ -851,7 +779,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
             </div>
 
-
             <!-- LOGIN -->
 
             <button
@@ -863,9 +790,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
             </button>
 
-
         </form>
-
 
         <!-- REGISTER -->
 
@@ -879,12 +804,9 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
         </div>
 
-
     </div>
 
-
 </div>
-
 
 </body>
 

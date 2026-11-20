@@ -3,100 +3,140 @@
 
 session_start();
 
+/* =========================================================
+   PREVENT BROWSER CACHING
+========================================================= */
+
 header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
 header("Cache-Control: post-check=0, pre-check=0", false);
 header("Pragma: no-cache");
 header("Expires: 0");
+
+/* =========================================================
+   CHECK LOGIN
+========================================================= */
 
 if (!isset($_SESSION['user_id'])) {
     header("Location: ../login.php");
     exit();
 }
 
-require_once "../config/database.php";
+/* =========================================================
+   SUPABASE CONNECTION
+========================================================= */
+
+require_once __DIR__ . "/../config/supabase.php";
 
 $user_id = (int) $_SESSION['user_id'];
 
-/* CHECK CURRENT USER */
+$database_error = false;
+$name = "Administrator";
 
-$stmt = $conn->prepare("
-    SELECT id, name, student_id, email, role
-    FROM users
-    WHERE id = ?
-");
+$total_items = 0;
+$total_lost = 0;
+$total_found = 0;
+$pending_claims = 0;
+$ai_matches = 0;
+$recent_items = [];
 
-$stmt->bind_param("i", $user_id);
-$stmt->execute();
+try {
 
-$result = $stmt->get_result();
-$user = $result->fetch_assoc();
-$stmt->close();
+    /* =====================================================
+       CHECK ADMIN ACCOUNT
+    ===================================================== */
 
-if (!$user || $user['role'] !== 'admin') {
-    header("Location: ../dashboard.php");
-    exit();
+    $stmt = $supabase->prepare("
+        SELECT id, name, role
+        FROM users
+        WHERE id = :user_id
+        LIMIT 1
+    ");
+
+    $stmt->execute([
+        ':user_id' => $user_id
+    ]);
+
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$user || $user['role'] !== 'admin') {
+        header("Location: ../dashboard.php");
+        exit();
+    }
+
+    $name = $user['name'];
+
+
+    /* =====================================================
+       DASHBOARD STATISTICS
+    ===================================================== */
+
+    $stmt = $supabase->query("
+        SELECT
+            COUNT(*) AS total_items,
+            COUNT(*) FILTER (WHERE item_type = 'lost') AS total_lost,
+            COUNT(*) FILTER (WHERE item_type = 'found') AS total_found
+        FROM items
+    ");
+
+    $statistics = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    $total_items = (int) $statistics['total_items'];
+    $total_lost = (int) $statistics['total_lost'];
+    $total_found = (int) $statistics['total_found'];
+
+
+    /* =====================================================
+       PENDING CLAIMS
+    ===================================================== */
+
+    $stmt = $supabase->query("
+        SELECT COUNT(*)
+        FROM claims
+        WHERE status = 'pending'
+    ");
+
+    $pending_claims = (int) $stmt->fetchColumn();
+
+
+    /* =====================================================
+       AI MATCHES
+    ===================================================== */
+
+    $stmt = $supabase->query("
+        SELECT COUNT(*)
+        FROM ai_matches
+    ");
+
+    $ai_matches = (int) $stmt->fetchColumn();
+
+
+    /* =====================================================
+       RECENT REPORTS WITH VERIFICATION CODES
+    ===================================================== */
+
+    $stmt = $supabase->query("
+        SELECT
+            id,
+            item_type,
+            item_name,
+            category,
+            location,
+            date_reported,
+            status,
+            verification_code
+        FROM items
+        ORDER BY created_at DESC
+        LIMIT 5
+    ");
+
+    $recent_items = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+} catch (PDOException $e) {
+
+    error_log("Admin Dashboard Database Error: " . $e->getMessage());
+
+    $database_error = true;
 }
-
-$name = $user['name'];
-
-/* TOTAL ITEMS */
-
-$result = $conn->query("
-    SELECT COUNT(*) AS total
-    FROM items
-");
-$total_items = (int) $result->fetch_assoc()['total'];
-
-/* TOTAL LOST ITEMS */
-
-$result = $conn->query("
-    SELECT COUNT(*) AS total
-    FROM items
-    WHERE item_type = 'lost'
-");
-$total_lost = (int) $result->fetch_assoc()['total'];
-
-/* TOTAL FOUND ITEMS */
-
-$result = $conn->query("
-    SELECT COUNT(*) AS total
-    FROM items
-    WHERE item_type = 'found'
-");
-$total_found = (int) $result->fetch_assoc()['total'];
-
-/* PENDING CLAIMS */
-
-$result = $conn->query("
-    SELECT COUNT(*) AS total
-    FROM claims
-    WHERE status = 'pending'
-");
-$pending_claims = (int) $result->fetch_assoc()['total'];
-
-/* AI MATCHES */
-
-$result = $conn->query("
-    SELECT COUNT(*) AS total
-    FROM ai_matches
-");
-$ai_matches = (int) $result->fetch_assoc()['total'];
-
-/* RECENT REPORTS */
-
-$recent_items = $conn->query("
-    SELECT
-        id,
-        item_type,
-        item_name,
-        category,
-        location,
-        date_reported,
-        status
-    FROM items
-    ORDER BY created_at DESC
-    LIMIT 5
-");
 
 ?>
 
@@ -251,43 +291,6 @@ body {
     line-height: 1.6;
 }
 
-/* MANAGEMENT LINKS */
-
-.admin-links {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 16px;
-    margin-bottom: 25px;
-}
-
-.admin-link-card {
-    display: block;
-    padding: 19px 20px;
-    background: #fff;
-    border: 1px solid #e2e8f0;
-    border-left: 4px solid #d4af37;
-    border-radius: 12px;
-    color: #0f3d75;
-    text-decoration: none;
-    font-size: 15px;
-    font-weight: 700;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.05);
-    transition: 0.18s;
-}
-
-.admin-link-card:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 22px rgba(11,61,145,0.10);
-}
-
-.admin-link-card span {
-    display: block;
-    margin-top: 6px;
-    color: #64748b;
-    font-size: 12px;
-    font-weight: 400;
-}
-
 /* STATISTICS */
 
 .stats {
@@ -352,7 +355,7 @@ body {
 table {
     width: 100%;
     border-collapse: collapse;
-    min-width: 850px;
+    min-width: 950px;
 }
 
 thead {
@@ -413,23 +416,54 @@ tbody tr:hover {
     color: #1d4ed8;
 }
 
-/* VIEW BUTTON */
+/* VERIFICATION CODE */
 
-.view-button {
-    display: inline-block;
-    padding: 7px 13px;
-    background: #0f3d75;
-    color: #fff;
-    text-decoration: none;
-    border-radius: 7px;
-    font-size: 12px;
-    font-weight: bold;
-    transition: 0.18s;
+.verification-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 210px;
 }
 
-.view-button:hover {
+.verification-code {
+    display: inline-block;
+    padding: 7px 9px;
+    background: #edf3fa;
+    border: 1px solid #d5e1ef;
+    border-radius: 6px;
+    color: #0f3d75;
+    font-size: 11px;
+    font-weight: bold;
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+}
+
+.copy-button {
+    padding: 7px 10px;
+    background: #0f3d75;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: bold;
+    cursor: pointer;
+    transition: 0.18s;
+    white-space: nowrap;
+}
+
+.copy-button:hover {
     background: #174ea6;
-    transform: translateY(-1px);
+}
+
+.copy-button:disabled {
+    opacity: 0.7;
+    cursor: default;
+}
+
+.no-code {
+    color: #94a3b8;
+    font-size: 12px;
+    font-style: italic;
 }
 
 /* EMPTY STATE */
@@ -444,6 +478,35 @@ tbody tr:hover {
     font-size: 14px;
 }
 
+/* DATABASE ERROR */
+
+.database-error {
+    padding: 15px 18px;
+    margin-bottom: 20px;
+    background: #fee2e2;
+    border: 1px solid #fecaca;
+    border-radius: 10px;
+    color: #991b1b;
+    font-size: 13px;
+}
+
+/* COPY FEEDBACK */
+
+.copy-feedback {
+    position: fixed;
+    bottom: 25px;
+    right: 25px;
+    padding: 12px 18px;
+    background: #0f3d75;
+    color: #fff;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: bold;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.15);
+    display: none;
+    z-index: 1000;
+}
+
 /* RESPONSIVE */
 
 @media (max-width: 1050px) {
@@ -453,9 +516,6 @@ tbody tr:hover {
 }
 
 @media (max-width: 800px) {
-    .admin-links {
-        grid-template-columns: 1fr;
-    }
 
     .admin-nav {
         overflow-x: auto;
@@ -474,6 +534,7 @@ tbody tr:hover {
 }
 
 @media (max-width: 600px) {
+
     .navbar {
         padding: 10px 4%;
     }
@@ -519,8 +580,10 @@ tbody tr:hover {
 
 @media print {
     .navbar,
-    .admin-nav {
-        display: none;
+    .admin-nav,
+    .copy-button,
+    .copy-feedback {
+        display: none !important;
     }
 }
 
@@ -529,11 +592,12 @@ tbody tr:hover {
 
 <body>
 
-<!-- TOP NAVBAR -->
+<!-- TOP NAVBAR - PRESERVED -->
 
 <div class="navbar">
 
     <a href="dashboard.php" class="brand">
+
         <div class="brand-text">
             <span class="brand-title">RTU Lost and Found</span>
             <span class="brand-subtitle">ADMINISTRATION</span>
@@ -544,18 +608,17 @@ tbody tr:hover {
             alt="RTU Logo"
             class="brand-logo"
         >
+
     </a>
 
 </div>
 
-<!-- ADMIN NAVIGATION -->
+<!-- ADMIN NAVIGATION - PRESERVED -->
 
 <nav class="admin-nav">
 
-    <a href="items.php">Manage Items</a>
-    <a href="claims.php">Manage Claims</a>
+    <a href="items.php">Item Verification</a>
     <a href="users.php">Users</a>
-    <a href="ai_matches.php">AI Matches</a>
 
 </nav>
 
@@ -563,38 +626,29 @@ tbody tr:hover {
 
 <div class="container">
 
+    <?php if ($database_error): ?>
+
+        <div class="database-error">
+            Unable to load dashboard information. Please check your database connection and try again.
+        </div>
+
+    <?php endif; ?>
+
+
+    <!-- WELCOME -->
+
     <div class="welcome">
 
         <h1>Admin Dashboard</h1>
 
         <p>
             Welcome,
-            <?php echo htmlspecialchars($name); ?>.
+            <?php echo htmlspecialchars($name, ENT_QUOTES, 'UTF-8'); ?>.
             Manage the RTU Lost and Found system from this page.
         </p>
 
     </div>
 
-    <!-- ADMIN MANAGEMENT LINKS -->
-
-    <div class="admin-links">
-
-        <a href="items.php" class="admin-link-card">
-            Manage Items
-            <span>Review and manage lost and found reports</span>
-        </a>
-
-        <a href="claims.php" class="admin-link-card">
-            Manage Claims
-            <span>Review submitted item claims</span>
-        </a>
-
-        <a href="users.php" class="admin-link-card">
-            Manage Users
-            <span>Manage registered system accounts</span>
-        </a>
-
-    </div>
 
     <!-- STATISTICS -->
 
@@ -627,13 +681,14 @@ tbody tr:hover {
 
     </div>
 
+
     <!-- RECENT REPORTS -->
 
     <div class="section">
 
         <h2>Recent Lost &amp; Found Reports</h2>
 
-        <?php if ($recent_items && $recent_items->num_rows > 0): ?>
+        <?php if (!empty($recent_items)): ?>
 
             <div class="table-container">
 
@@ -647,13 +702,13 @@ tbody tr:hover {
                             <th>Location</th>
                             <th>Date</th>
                             <th>Status</th>
-                            <th>Action</th>
+                            <th>Verification Code</th>
                         </tr>
                     </thead>
 
                     <tbody>
 
-                        <?php while ($item = $recent_items->fetch_assoc()): ?>
+                        <?php foreach ($recent_items as $item): ?>
 
                             <?php
 
@@ -667,47 +722,84 @@ tbody tr:hover {
                                 $badge_class = 'returned';
                             }
 
+                            $verification_code = trim(
+                                (string) ($item['verification_code'] ?? '')
+                            );
+
                             ?>
 
                             <tr>
 
                                 <td>
-                                    <?php echo htmlspecialchars($item['item_name']); ?>
+                                    <?php echo htmlspecialchars((string) $item['item_name'], ENT_QUOTES, 'UTF-8'); ?>
                                 </td>
 
                                 <td>
-                                    <?php echo htmlspecialchars(ucfirst($item['item_type'])); ?>
+                                    <?php echo htmlspecialchars(ucfirst((string) $item['item_type']), ENT_QUOTES, 'UTF-8'); ?>
                                 </td>
 
                                 <td>
-                                    <?php echo htmlspecialchars($item['category']); ?>
+                                    <?php echo htmlspecialchars((string) $item['category'], ENT_QUOTES, 'UTF-8'); ?>
                                 </td>
 
                                 <td>
-                                    <?php echo htmlspecialchars($item['location']); ?>
+                                    <?php echo htmlspecialchars((string) $item['location'], ENT_QUOTES, 'UTF-8'); ?>
                                 </td>
 
                                 <td>
-                                    <?php echo htmlspecialchars($item['date_reported']); ?>
+                                    <?php echo htmlspecialchars((string) $item['date_reported'], ENT_QUOTES, 'UTF-8'); ?>
                                 </td>
 
                                 <td>
-                                    <span class="badge <?php echo htmlspecialchars($badge_class); ?>">
+
+                                    <span class="badge <?php echo htmlspecialchars($badge_class, ENT_QUOTES, 'UTF-8'); ?>">
+
                                         <?php
                                         echo htmlspecialchars(
-                                            ucfirst(str_replace('_', ' ', $item['status']))
+                                            ucfirst(str_replace('_', ' ', (string) $item['status'])),
+                                            ENT_QUOTES,
+                                            'UTF-8'
                                         );
                                         ?>
+
                                     </span>
+
                                 </td>
 
                                 <td>
-                                    <a href="items.php" class="view-button">View</a>
+
+                                    <?php if ($verification_code !== ''): ?>
+
+                                        <div class="verification-wrapper">
+
+                                            <span class="verification-code">
+                                                <?php echo htmlspecialchars($verification_code, ENT_QUOTES, 'UTF-8'); ?>
+                                            </span>
+
+                                            <button
+                                                type="button"
+                                                class="copy-button"
+                                                data-code="<?php echo htmlspecialchars($verification_code, ENT_QUOTES, 'UTF-8'); ?>"
+                                                onclick="copyVerificationCode(this)"
+                                            >
+                                                Copy
+                                            </button>
+
+                                        </div>
+
+                                    <?php else: ?>
+
+                                        <span class="no-code">
+                                            Not available
+                                        </span>
+
+                                    <?php endif; ?>
+
                                 </td>
 
                             </tr>
 
-                        <?php endwhile; ?>
+                        <?php endforeach; ?>
 
                     </tbody>
 
@@ -727,14 +819,102 @@ tbody tr:hover {
 
 </div>
 
+<!-- COPY FEEDBACK -->
+
+<div class="copy-feedback" id="copyFeedback">
+    Verification code copied.
+</div>
+
 <script>
 
-/* PREVENT BACK/FORWARD CACHE */
+/* =========================================================
+   COPY VERIFICATION CODE
+========================================================= */
+
+async function copyVerificationCode(button) {
+
+    const code = button.getAttribute("data-code");
+
+    if (!code) {
+        return;
+    }
+
+    try {
+
+        if (navigator.clipboard && window.isSecureContext) {
+
+            await navigator.clipboard.writeText(code);
+
+        } else {
+
+            const temporaryInput = document.createElement("textarea");
+
+            temporaryInput.value = code;
+            temporaryInput.style.position = "fixed";
+            temporaryInput.style.opacity = "0";
+
+            document.body.appendChild(temporaryInput);
+
+            temporaryInput.select();
+
+            const copied = document.execCommand("copy");
+
+            document.body.removeChild(temporaryInput);
+
+            if (!copied) {
+                throw new Error("Copy operation failed.");
+            }
+        }
+
+        const originalText = button.textContent;
+
+        button.textContent = "Copied";
+        button.disabled = true;
+
+        showCopyFeedback();
+
+        setTimeout(function() {
+            button.textContent = originalText;
+            button.disabled = false;
+        }, 1500);
+
+    } catch (error) {
+
+        alert("Unable to copy the verification code. Please copy it manually.");
+
+    }
+}
+
+
+/* =========================================================
+   COPY FEEDBACK
+========================================================= */
+
+function showCopyFeedback() {
+
+    const feedback = document.getElementById("copyFeedback");
+
+    feedback.style.display = "block";
+
+    clearTimeout(window.copyFeedbackTimeout);
+
+    window.copyFeedbackTimeout = setTimeout(function() {
+        feedback.style.display = "none";
+    }, 2000);
+
+}
+
+
+/* =========================================================
+   PREVENT BACK/FORWARD CACHE
+========================================================= */
 
 window.addEventListener("pageshow", function(event) {
+
     if (event.persisted) {
         window.location.reload();
     }
+
 });
 
 </script>
